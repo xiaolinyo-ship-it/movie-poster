@@ -552,6 +552,8 @@ class MainWindow(QMainWindow):
         self._recent_sort_generation = 0
         self._recent_worker = None
         self._poster_pixmap_cache: dict[tuple, QPixmap] = {}
+        self._closing = False
+        self._close_poll_scheduled = False
 
         self.setWindowTitle("小林影业 · NAS")
         self.resize(1180, 780)
@@ -910,6 +912,14 @@ class MainWindow(QMainWindow):
         }
 
     def _start_recent_sort(self):
+        old_worker = self._recent_worker
+        if old_worker and old_worker.isRunning():
+            old_worker.requestInterruption()
+            if not old_worker.wait(3000):
+                # Never replace a live worker reference; its result remains
+                # valid and will be generation-filtered when it completes.
+                return
+        self._recent_worker = None
         items = {}
         for rows in (self._home_source_rows or {}).values():
             for row in rows:
@@ -1058,6 +1068,11 @@ class MainWindow(QMainWindow):
 
     # ---------- 扫描 ----------
     def scan(self):
+        if self._closing:
+            return
+        if getattr(self, "worker", None) and self.worker.isRunning():
+            self.status_label.setText("扫描正在进行中，请勿重复启动")
+            return
         tv_root = self.config.get("tv_root")
         movie_root = self.config.get("movie_root")
         if not tv_root or not os.path.isdir(tv_root) or not os.path.isdir(movie_root):
@@ -1500,18 +1515,39 @@ class MainWindow(QMainWindow):
             self._show_continue()
 
     def closeEvent(self, event):
-        # 优雅停止后台线程，避免窗口销毁时仍有 QThread 在运行。
-        if getattr(self, "worker", None) and self.worker.isRunning():
-            self.worker.requestInterruption()
-            self.worker.wait(5000)
-        if self._recent_worker and self._recent_worker.isRunning():
-            self._recent_worker.requestInterruption()
-            self._recent_worker.wait(3000)
-        self.pool.clear()
-        self.pool.waitForDone(3000)
+        # Do not destroy the window while either managed QThread is still
+        # running.  Scan code may be inside a NAS call and cannot be force-
+        # terminated safely, so close is deferred and polled instead.
+        self._closing = True
+        if self.refresh_btn:
+            self.refresh_btn.setEnabled(False)
         if self._play_timer.isActive():
             self._play_timer.stop()
+        scan_running = bool(getattr(self, "worker", None) and self.worker.isRunning())
+        recent_running = bool(self._recent_worker and self._recent_worker.isRunning())
+        if scan_running:
+            self.worker.requestInterruption()
+        if recent_running:
+            self._recent_worker.requestInterruption()
+        if scan_running or recent_running:
+            event.ignore()
+            if not self._close_poll_scheduled:
+                self._close_poll_scheduled = True
+                QTimer.singleShot(100, self._poll_close)
+            return
+        self.pool.clear()
+        self.pool.waitForDone(3000)
         super().closeEvent(event)
+
+    def _poll_close(self):
+        self._close_poll_scheduled = False
+        scan_running = bool(getattr(self, "worker", None) and self.worker.isRunning())
+        recent_running = bool(self._recent_worker and self._recent_worker.isRunning())
+        if scan_running or recent_running:
+            self._close_poll_scheduled = True
+            QTimer.singleShot(100, self._poll_close)
+            return
+        self.close()
 
 
 class BackdropBanner(QFrame):
