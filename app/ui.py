@@ -550,6 +550,7 @@ class MainWindow(QMainWindow):
         self._home_media_cache = None
         self._home_source_rows = None
         self._recent_sort_generation = 0
+        self._recent_sort_keys = None
         self._recent_worker = None
         self._poster_pixmap_cache: dict[tuple, QPixmap] = {}
         self._closing = False
@@ -868,10 +869,12 @@ class MainWindow(QMainWindow):
         section.setMinimumHeight(row_height + 38)
         return section
 
-    def _invalidate_home_cache(self):
+    def _invalidate_home_cache(self, reset_recent_sort: bool = False):
         self._home_media_cache = None
         self._home_source_rows = None
-        self._recent_sort_generation += 1
+        if reset_recent_sort:
+            self._recent_sort_keys = None
+            self._recent_sort_generation += 1
 
     def _build_home_cache(self, sort_keys=None):
         source = self._home_source_rows or {"tv": [], "movie": []}
@@ -943,8 +946,23 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _recent_sort_done(self, generation: int, sort_keys: dict):
-        if generation != self._recent_sort_generation or self._home_source_rows is None:
+        if generation != self._recent_sort_generation:
             return
+        # Metadata callbacks can invalidate the display cache while this
+        # worker is reading NAS timestamps. The paths did not change, so the
+        # measured ordering is still valid; rebuild the source rows before
+        # applying it instead of throwing the result away.
+        if self._home_source_rows is None:
+            self._refresh_library_art()
+            self._home_source_rows = {
+                kind: [self.store.get_item(i) for i in self.items.get(kind, [])]
+                for kind in ("tv", "movie")
+            }
+            self._home_source_rows = {
+                kind: [row for row in rows if row]
+                for kind, rows in self._home_source_rows.items()
+            }
+        self._recent_sort_keys = sort_keys
         self._home_media_cache = self._build_home_cache(sort_keys)
         if self.stack.currentIndex() == 0 and self.current_kind == "continue":
             self._populate_home()
@@ -971,10 +989,15 @@ class MainWindow(QMainWindow):
                 kind: [row for row in rows if row]
                 for kind, rows in self._home_source_rows.items()
             }
-            # Build immediately from local DB timestamps; remote file times are
-            # refined in RecentFilesWorker without blocking the first paint.
-            self._home_media_cache = self._build_home_cache()
-            self._start_recent_sort()
+            # Build immediately from the local cache when available. The
+            # first-ever load is refined by RecentFilesWorker without blocking
+            # the first paint; later metadata refreshes reuse those measured
+            # directory times and never revert to title/ID order.
+            self._home_media_cache = self._build_home_cache(self._recent_sort_keys)
+            if self._recent_sort_keys is None and not (
+                self._recent_worker and self._recent_worker.isRunning()
+            ):
+                self._start_recent_sort()
 
         data = self._home_media_cache
         if data["next"]:
@@ -1102,7 +1125,7 @@ class MainWindow(QMainWindow):
         tv = list(getattr(worker, "tv_items", ()))
         movies = list(getattr(worker, "movie_items", ()))
         self.refresh_btn.setEnabled(True)
-        self._invalidate_home_cache()
+        self._invalidate_home_cache(reset_recent_sort=True)
         self.tv_items = tv
         self.movie_items = movies
         was_detail = self.stack.currentIndex() == 1
