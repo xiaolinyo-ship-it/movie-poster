@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 from PySide6.QtCore import QObject, QRunnable, QThread, Signal
@@ -32,6 +33,45 @@ class ScanWorker(QThread):
             self.finished_scan.emit(tv, movies)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class RecentFilesWorker(QThread):
+    """Read NAS file timestamps without blocking the Qt/UI thread.
+
+    The worker receives plain paths only; it never touches the shared Store
+    connection.  Missing or unavailable files fall back to the item's
+    database timestamp in the UI.
+    """
+
+    # ``dict`` is not a reliable queued-signal type in all PySide6 builds;
+    # object keeps the payload in Python space across the worker boundary.
+    finished_times = Signal(int, object)
+    error = Signal(int, str)
+
+    def __init__(self, generation: int, items: dict[int, list[str]]):
+        super().__init__()
+        self.generation = generation
+        self.items = items
+
+    def run(self):
+        try:
+            result: dict[int, tuple[int, float]] = {}
+            for item_id, paths in self.items.items():
+                latest = 0.0
+                for path in paths:
+                    if self.isInterruptionRequested():
+                        return
+                    try:
+                        latest = max(latest, os.path.getmtime(path))
+                    except (OSError, ValueError):
+                        try:
+                            latest = max(latest, os.path.getctime(path))
+                        except (OSError, ValueError):
+                            continue
+                result[item_id] = (1 if latest else 0, latest)
+            self.finished_times.emit(self.generation, result)
+        except Exception as exc:
+            self.error.emit(self.generation, str(exc))
 
 
 class DoubanTask(QRunnable):

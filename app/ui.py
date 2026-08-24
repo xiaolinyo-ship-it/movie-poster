@@ -86,6 +86,7 @@ from .workers import (
     ManualSearchWorker,
     OrganizeApplyWorker,
     OrganizePlanWorker,
+    RecentFilesWorker,
     ScanWorker,
     TmdbTask,
     TmdbSignals,
@@ -547,6 +548,9 @@ class MainWindow(QMainWindow):
         self.current_kind = "tv"
         self.poster_paths: dict[int, str] = {}
         self._home_media_cache = None
+        self._home_source_rows = None
+        self._recent_sort_generation = 0
+        self._recent_worker = None
         self._poster_pixmap_cache: dict[tuple, QPixmap] = {}
 
         self.setWindowTitle("小林影业 · NAS")
@@ -555,8 +559,10 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_QSS)
         self._build_ui()
         self._connect()
-        self._show_continue()
-        self.scan()
+        # Let the window enter the Qt event loop before doing any first-load
+        # work.  NAS scanning and the initial home refresh are both deferred.
+        QTimer.singleShot(0, self._show_continue)
+        QTimer.singleShot(0, self.scan)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -862,6 +868,75 @@ class MainWindow(QMainWindow):
 
     def _invalidate_home_cache(self):
         self._home_media_cache = None
+        self._home_source_rows = None
+        self._recent_sort_generation += 1
+
+    def _build_home_cache(self, sort_keys=None):
+        source = self._home_source_rows or {"tv": [], "movie": []}
+
+        def rows_for(kind: str):
+            rows = list(source.get(kind, []))
+            if sort_keys is None:
+                rows.sort(key=lambda r: (r["updated_at"] or ""), reverse=True)
+            else:
+                rows.sort(
+                    key=lambda r: (
+                        sort_keys.get(int(r["id"]), (0, 0.0))[0],
+                        sort_keys.get(int(r["id"]), (0, 0.0))[1],
+                        r["updated_at"] or "",
+                    ),
+                    reverse=True,
+                )
+            return rows
+
+        def entries(rows, subtitle):
+            return [(r["id"], r["title"], r["poster"] or "", subtitle) for r in rows[:18]]
+
+        tv_rows = rows_for("tv")
+        movie_rows = rows_for("movie")
+        rated = sorted(
+            [r for r in tv_rows + movie_rows if r["rating"] is not None],
+            key=lambda r: (float(r["rating"] or 0), r["updated_at"] or ""),
+            reverse=True,
+        )
+        return {
+            "next": self._next_up_entries(),
+            "tv": entries(tv_rows, "电视剧"),
+            "movie": entries(movie_rows, "电影"),
+            "rated": [
+                (r["id"], r["title"], r["poster"] or "", f"豆瓣 {float(r['rating']):.1f}")
+                for r in rated[:18]
+            ],
+        }
+
+    def _start_recent_sort(self):
+        items = {}
+        for rows in (self._home_source_rows or {}).values():
+            for row in rows:
+                paths = []
+                try:
+                    paths = [str(f["path"] or "") for f in self.store.list_files(row["id"]) if f["path"]]
+                except Exception:
+                    pass
+                items[int(row["id"])] = paths
+        self._recent_sort_generation += 1
+        worker = RecentFilesWorker(self._recent_sort_generation, items)
+        worker.finished_times.connect(self._recent_sort_done)
+        worker.error.connect(self._recent_sort_error)
+        self._recent_worker = worker
+        worker.start()
+
+    def _recent_sort_done(self, generation: int, sort_keys: dict):
+        if generation != self._recent_sort_generation or self._home_source_rows is None:
+            return
+        self._home_media_cache = self._build_home_cache(sort_keys)
+        if self.stack.currentIndex() == 0 and self.current_kind == "continue":
+            self._populate_home()
+
+    def _recent_sort_error(self, generation: int, message: str):
+        # File-time ordering is an enhancement; database ordering remains valid.
+        if generation == self._recent_sort_generation:
+            self._recent_worker = None
 
     def _populate_home(self):
         while self.home_rows.count():
@@ -872,53 +947,18 @@ class MainWindow(QMainWindow):
         if self._home_media_cache is None:
             # 首次进入才读取数据库、解析文件时间和刷新库入口图片。
             self._refresh_library_art()
-            next_entries = self._next_up_entries()
-
-            def rows_for(kind: str):
-                rows = [self.store.get_item(i) for i in self.items.get(kind, [])]
-                rows = [r for r in rows if r]
-
-                def recent_key(row):
-                    file_times = []
-                    try:
-                        files = self.store.list_files(row["id"])
-                    except Exception:
-                        files = []
-                    for file_row in files:
-                        path = str(file_row["path"] or "")
-                        try:
-                            file_times.append(os.path.getmtime(path))
-                        except (OSError, ValueError):
-                            try:
-                                file_times.append(os.path.getctime(path))
-                            except (OSError, ValueError):
-                                continue
-                    if file_times:
-                        return (1, max(file_times), "")
-                    return (0, 0.0, row["updated_at"] or "")
-
-                rows.sort(key=recent_key, reverse=True)
-                return rows
-
-            def entries(rows, subtitle):
-                return [(r["id"], r["title"], r["poster"] or "", subtitle) for r in rows[:18]]
-
-            tv_rows = rows_for("tv")
-            movie_rows = rows_for("movie")
-            rated = sorted(
-                [r for r in tv_rows + movie_rows if r["rating"] is not None],
-                key=lambda r: (float(r["rating"] or 0), r["updated_at"] or ""),
-                reverse=True,
-            )
-            self._home_media_cache = {
-                "next": next_entries,
-                "tv": entries(tv_rows, "电视剧"),
-                "movie": entries(movie_rows, "电影"),
-                "rated": [
-                    (r["id"], r["title"], r["poster"] or "", f"豆瓣 {float(r['rating']):.1f}")
-                    for r in rated[:18]
-                ],
+            self._home_source_rows = {
+                kind: [self.store.get_item(i) for i in self.items.get(kind, [])]
+                for kind in ("tv", "movie")
             }
+            self._home_source_rows = {
+                kind: [row for row in rows if row]
+                for kind, rows in self._home_source_rows.items()
+            }
+            # Build immediately from local DB timestamps; remote file times are
+            # refined in RecentFilesWorker without blocking the first paint.
+            self._home_media_cache = self._build_home_cache()
+            self._start_recent_sort()
 
         data = self._home_media_cache
         if data["next"]:
@@ -1458,6 +1498,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # 优雅停止后台豆瓣任务，避免退出时线程报错
+        if self._recent_worker and self._recent_worker.isRunning():
+            self._recent_worker.requestInterruption()
+            self._recent_worker.wait(3000)
         self.pool.clear()
         self.pool.waitForDone(3000)
         if self._play_timer.isActive():
