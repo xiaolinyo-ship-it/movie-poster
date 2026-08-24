@@ -1076,7 +1076,10 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"扫描失败：{msg}")
 
-    def _scan_done(self, tv, movies):
+    def _scan_done(self):
+        worker = self.worker
+        tv = list(getattr(worker, "tv_items", ()))
+        movies = list(getattr(worker, "movie_items", ()))
         self.refresh_btn.setEnabled(True)
         self._invalidate_home_cache()
         self.tv_items = tv
@@ -1497,7 +1500,10 @@ class MainWindow(QMainWindow):
             self._show_continue()
 
     def closeEvent(self, event):
-        # 优雅停止后台豆瓣任务，避免退出时线程报错
+        # 优雅停止后台线程，避免窗口销毁时仍有 QThread 在运行。
+        if getattr(self, "worker", None) and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait(5000)
         if self._recent_worker and self._recent_worker.isRunning():
             self._recent_worker.requestInterruption()
             self._recent_worker.wait(3000)

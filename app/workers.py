@@ -15,22 +15,26 @@ from .organize import apply_plan, build_plan, undo_last
 
 class ScanWorker(QThread):
     progress = Signal(str)
-    finished_scan = Signal(list, list)  # tv items, movie items
+    # Keep nested scan results on the worker; do not marshal the full object
+    # graph through a queued Qt signal on Windows.
+    finished_scan = Signal()
     error = Signal(str)
 
     def __init__(self, tv_root: str, movie_root: str):
         super().__init__()
         self.tv_root = tv_root
         self.movie_root = movie_root
+        self.tv_items = []
+        self.movie_items = []
 
     def run(self):
         try:
             self.progress.emit("正在扫描电视剧目录…")
-            tv = scanner.scan_tv(self.tv_root)
-            self.progress.emit(f"电视剧 {len(tv)} 部，扫描电影目录…")
-            movies = scanner.scan_movies(self.movie_root)
-            self.progress.emit(f"扫描完成：电视剧 {len(tv)} 部，电影 {len(movies)} 部")
-            self.finished_scan.emit(tv, movies)
+            self.tv_items = scanner.scan_tv(self.tv_root)
+            self.progress.emit(f"电视剧 {len(self.tv_items)} 部，扫描电影目录…")
+            self.movie_items = scanner.scan_movies(self.movie_root)
+            self.progress.emit(f"扫描完成：电视剧 {len(self.tv_items)} 部，电影 {len(self.movie_items)} 部")
+            self.finished_scan.emit()
         except Exception as e:
             self.error.emit(str(e))
 
