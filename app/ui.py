@@ -928,7 +928,13 @@ class MainWindow(QMainWindow):
                     paths = [str(f["path"] or "") for f in self.store.list_files(row["id"]) if f["path"]]
                 except Exception:
                     pass
-                items[int(row["id"])] = paths
+                # "最近添加" follows the media directory's last modified
+                # time, the same value users see in Windows Explorer.  File
+                # timestamps remain a fallback for unavailable NAS folders.
+                items[int(row["id"])] = {
+                    "root": str(row["path"] or ""),
+                    "files": paths,
+                }
         self._recent_sort_generation += 1
         worker = RecentFilesWorker(self._recent_sort_generation, items)
         worker.finished_times.connect(self._recent_sort_done)

@@ -40,11 +40,12 @@ class ScanWorker(QThread):
 
 
 class RecentFilesWorker(QThread):
-    """Read NAS file timestamps without blocking the Qt/UI thread.
+    """Read media-directory timestamps without blocking the Qt/UI thread.
 
-    The worker receives plain paths only; it never touches the shared Store
-    connection.  Missing or unavailable files fall back to the item's
-    database timestamp in the UI.
+    ``root`` is the media item's directory and is the primary ordering key,
+    matching Windows Explorer's ``修改日期`` (last modified date).  ``files``
+    are only a fallback for an unavailable directory.  The worker receives
+    plain paths only; it never touches the shared Store connection.
     """
 
     # ``dict`` is not a reliable queued-signal type in all PySide6 builds;
@@ -52,7 +53,7 @@ class RecentFilesWorker(QThread):
     finished_times = Signal(int, object)
     error = Signal(int, str)
 
-    def __init__(self, generation: int, items: dict[int, list[str]]):
+    def __init__(self, generation: int, items: dict[int, object]):
         super().__init__()
         self.generation = generation
         self.items = items
@@ -60,18 +61,41 @@ class RecentFilesWorker(QThread):
     def run(self):
         try:
             result: dict[int, tuple[int, float]] = {}
-            for item_id, paths in self.items.items():
+            for item_id, value in self.items.items():
                 latest = 0.0
-                for path in paths:
-                    if self.isInterruptionRequested():
-                        return
+                root = ""
+                fallback_files: list[str] = []
+                if isinstance(value, dict):
+                    root = str(value.get("root") or "")
+                    fallback_files = [str(p) for p in (value.get("files") or []) if p]
+                else:
+                    # Keep compatibility with callers that provide a plain
+                    # path list.
+                    fallback_files = [str(p) for p in (value or []) if p]
+
+                if root:
                     try:
-                        latest = max(latest, os.path.getmtime(path))
+                        latest = os.path.getmtime(root)
                     except (OSError, ValueError):
                         try:
-                            latest = max(latest, os.path.getctime(path))
+                            latest = os.path.getctime(root)
                         except (OSError, ValueError):
-                            continue
+                            latest = 0.0
+
+                # If the item directory is unavailable, use the newest media
+                # file as a best-effort fallback.  This keeps NAS disconnects
+                # non-fatal while preserving the intended directory ordering.
+                if not latest:
+                    for path in fallback_files:
+                        if self.isInterruptionRequested():
+                            return
+                        try:
+                            latest = max(latest, os.path.getmtime(path))
+                        except (OSError, ValueError):
+                            try:
+                                latest = max(latest, os.path.getctime(path))
+                            except (OSError, ValueError):
+                                continue
                 result[item_id] = (1 if latest else 0, latest)
             self.finished_times.emit(self.generation, result)
         except Exception as exc:
