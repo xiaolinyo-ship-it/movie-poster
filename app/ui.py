@@ -444,6 +444,21 @@ class MediaLibraryCard(QFrame):
         painter.end()
 
 
+def _rounded_pixmap(pixmap: QPixmap, width: int, height: int, radius: float = 8.0) -> QPixmap:
+    """Clip artwork corners so a QPushButton icon cannot cover its rounding."""
+    rounded = QPixmap(width, height)
+    rounded.fill(Qt.transparent)
+    painter = QPainter(rounded)
+    painter.setRenderHint(QPainter.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.setClipping(False)
+    painter.end()
+    return rounded
+
+
 class ContinueWatchingCard(QWidget):
     """16:9 resume card with title, subtitle and a visible progress bar."""
 
@@ -456,10 +471,10 @@ class ContinueWatchingCard(QWidget):
         button = QPushButton()
         button.setFixedSize(350, 196)
         button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet("QPushButton { border: 1px solid #2b3038; border-radius: 7px; background: #20252c; } QPushButton:hover { border: 2px solid #d7dde7; }")
+        button.setStyleSheet("QPushButton { border: 1px solid #2b3038; border-radius: 8px; background: #20252c; } QPushButton:hover { border: 2px solid #d7dde7; }")
         if poster and os.path.exists(poster):
             pix = win._cover_pixmap(poster, 350, 196)
-            button.setIcon(QIcon(pix))
+            button.setIcon(QIcon(_rounded_pixmap(pix, 350, 196, 8)))
             button.setIconSize(QSize(350, 196))
         else:
             button.setText(title[:16])
