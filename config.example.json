@@ -1,0 +1,9 @@
+{
+  "tv_root": "D:\\Media\\TV",
+  "movie_root": "D:\\Media\\Movies",
+  "potplayer": "C:\\Program Files\\DAUM\\PotPlayer\\PotPlayerMini64.exe",
+  "douban_enabled": true,
+  "tmdb_api_key": "",
+  "request_delay": 0.8,
+  "theme": "dark"
+}
