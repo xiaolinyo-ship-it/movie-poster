@@ -7,8 +7,9 @@ from pathlib import Path
 
 
 DEFAULT_CONFIG = {
-    "tv_root": r"\\example-nas\tv",
-    "movie_root": r"\\example-nas\video",
+    # Keep public defaults portable. Users can point these at local folders or UNC/NAS shares.
+    "tv_root": "",
+    "movie_root": "",
     "potplayer": r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
     "douban_enabled": True,
     "tmdb_api_key": "",
