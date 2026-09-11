@@ -575,7 +575,6 @@ class MainWindow(QMainWindow):
         self._close_poll_scheduled = False
         self.subscription_items: list[dict[str, str]] = []
         self._subscription_item_ids: set[int] = set()
-        self._subscription_update_by_item: dict[int, str] = {}
         self._load_subscription_cache()
 
         self.setWindowTitle("小林影业 · NAS")
@@ -610,7 +609,6 @@ class MainWindow(QMainWindow):
 
     def _rebuild_subscription_matches(self) -> None:
         self._subscription_item_ids = set()
-        self._subscription_update_by_item = {}
         if not self.subscription_items:
             return
         for kind in ("tv", "movie"):
@@ -618,12 +616,7 @@ class MainWindow(QMainWindow):
                 for item in self.subscription_items:
                     if titles_match(str(row["title"] or ""), item["title"]):
                         self._subscription_item_ids.add(int(row["id"]))
-                        self._subscription_update_by_item[int(row["id"])] = item["updated_at"]
                         break
-
-    def _subscription_rows(self, kind: str, rows: list[dict]) -> list[dict]:
-        """Fail closed: homepage data is empty until the subscription page syncs."""
-        return [row for row in rows if int(row["id"]) in self._subscription_item_ids]
 
     def _home_rows_for_kind(self, kind: str) -> list[dict]:
         rows = []
@@ -631,7 +624,26 @@ class MainWindow(QMainWindow):
             row = self.store.get_item(item_id)
             if row:
                 rows.append(row)
-        return self._subscription_rows(kind, rows)
+        return rows
+
+    def _subscription_entries(self) -> list[tuple]:
+        """Build the replacement home row in the source page's update order."""
+        source = self._home_source_rows or {"tv": [], "movie": []}
+        result = []
+        seen = set()
+        for item in self.subscription_items:
+            for rows in source.values():
+                for row in rows:
+                    item_id = int(row["id"])
+                    if item_id in seen or item_id not in self._subscription_item_ids:
+                        continue
+                    if not titles_match(str(row["title"] or ""), item["title"]):
+                        continue
+                    seen.add(item_id)
+                    result.append(
+                        (item_id, row["title"], row["poster"] or "", f"更新：{item['updated_at']}")
+                    )
+        return result
 
     def sync_subscriptions(self) -> None:
         url = str(self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL) or DEFAULT_SUBSCRIPTION_URL)
@@ -777,11 +789,11 @@ class MainWindow(QMainWindow):
         library_layout.setContentsMargins(32, 20, 32, 30)
         library_layout.setSpacing(18)
 
-        self.section_title = QLabel("我的订阅")
+        self.section_title = QLabel("我的媒体")
         self.section_title.setObjectName("sectionTitle")
         self.section_title.setFont(role_font("title"))
         library_layout.addWidget(self.section_title)
-        self.section_subtitle = QLabel("只显示 dyjie.net 订阅中有更新的内容")
+        self.section_subtitle = QLabel("从上次停下的地方继续播放")
         self.section_subtitle.setObjectName("sectionSubtitle")
         library_layout.addWidget(self.section_subtitle)
 
@@ -997,15 +1009,7 @@ class MainWindow(QMainWindow):
             return rows
 
         def entries(rows, subtitle):
-            return [
-                (
-                    r["id"],
-                    r["title"],
-                    r["poster"] or "",
-                    f"更新：{self._subscription_update_by_item.get(int(r['id']), subtitle)}",
-                )
-                for r in rows[:18]
-            ]
+            return [(r["id"], r["title"], r["poster"] or "", subtitle) for r in rows[:18]]
 
         tv_rows = rows_for("tv")
         movie_rows = rows_for("movie")
@@ -1015,7 +1019,7 @@ class MainWindow(QMainWindow):
             reverse=True,
         )
         return {
-            "next": self._next_up_entries(),
+            "subscriptions": self._subscription_entries(),
             "tv": entries(tv_rows, "电视剧"),
             "movie": entries(movie_rows, "电影"),
             "rated": [
@@ -1110,20 +1114,19 @@ class MainWindow(QMainWindow):
                 self._start_recent_sort()
 
         data = self._home_media_cache
-        if not self.subscription_items:
-            empty = QLabel("尚未同步订阅。请打开左上角菜单，选择“同步我的订阅”并登录 dyjie.net。")
+        if data["subscriptions"]:
+            self.home_rows.addWidget(self._make_media_row("我的订阅", data["subscriptions"]))
+        else:
+            message = (
+                "尚未同步订阅。请打开左上角菜单，选择“同步我的订阅”并登录 dyjie.net。"
+                if not self.subscription_items
+                else "订阅页有更新，但当前媒体库没有匹配条目。"
+            )
+            empty = QLabel(f"我的订阅：{message}")
             empty.setStyleSheet("color: #9aa4b2; padding: 18px 0;")
             self.home_rows.addWidget(empty)
-            return
-        if not self._subscription_item_ids:
-            empty = QLabel("订阅页有更新，但当前媒体库没有匹配条目。")
-            empty.setStyleSheet("color: #9aa4b2; padding: 18px 0;")
-            self.home_rows.addWidget(empty)
-            return
-        if data["next"]:
-            self.home_rows.addWidget(self._make_media_row("接下来", data["next"], card_type="continue"))
-        self.home_rows.addWidget(self._make_media_row("最近更新的电视剧", data["tv"]))
-        self.home_rows.addWidget(self._make_media_row("最近更新的电影", data["movie"]))
+        self.home_rows.addWidget(self._make_media_row("最近添加的电视剧", data["tv"]))
+        self.home_rows.addWidget(self._make_media_row("最近添加的电影", data["movie"]))
         self.home_rows.addWidget(self._make_media_row("高评分", data["rated"]))
 
     @staticmethod
@@ -1160,8 +1163,6 @@ class MainWindow(QMainWindow):
         result = []
         seen = set()
         for row, _series_ratio in self.store.continuing_items():
-            if int(row["id"]) not in self._subscription_item_ids:
-                continue
             files = self.store.list_files(row["id"])
             episodes = [f for f in files if f["episode"] is not None]
             episodes.sort(key=lambda f: (int(f["season"] or 1), int(f["episode"] or 0)))
@@ -1533,11 +1534,11 @@ class MainWindow(QMainWindow):
         self.grid.setVisible(False)
         self.tv_library_btn.setVisible(True)
         self.movie_library_btn.setVisible(True)
-        # “接下来” is rendered as a home channel inside home_rows; keep the
-        # legacy grid heading hidden so it cannot duplicate the channel title.
+        # The subscription row is rendered inside home_rows; keep the legacy
+        # grid heading hidden so it cannot duplicate a home channel title.
         self.continue_heading.setVisible(False)
-        self.section_title.setText("我的订阅")
-        self.section_subtitle.setText("只显示 dyjie.net 订阅中有更新的内容")
+        self.section_title.setText("我的媒体")
+        self.section_subtitle.setText("从上次停下的地方继续播放")
         self.section_subtitle.show()
         self._update_library_stats()
         self._populate_home()
