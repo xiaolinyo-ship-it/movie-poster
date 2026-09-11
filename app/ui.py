@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -79,6 +80,8 @@ from .config import Config
 from .douban import DoubanClient
 from .store import Store
 from .image_provider import ImageProviderManager
+from .subscription_dialog import SubscriptionSyncDialog
+from .subscriptions import DEFAULT_SUBSCRIPTION_URL, titles_match
 from .workers import (
     ApplySubjectWorker,
     DoubanTask,
@@ -570,6 +573,10 @@ class MainWindow(QMainWindow):
         self._poster_pixmap_cache: dict[tuple, QPixmap] = {}
         self._closing = False
         self._close_poll_scheduled = False
+        self.subscription_items: list[dict[str, str]] = []
+        self._subscription_item_ids: set[int] = set()
+        self._subscription_update_by_item: dict[int, str] = {}
+        self._load_subscription_cache()
 
         self.setWindowTitle("小林影业 · NAS")
         self.resize(1180, 780)
@@ -583,6 +590,85 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.scan)
 
     # ---------- UI ----------
+    def _load_subscription_cache(self) -> None:
+        path = self.config.subscription_cache_path
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items = data.get("items", []) if isinstance(data, dict) else []
+            self.subscription_items = [
+                {
+                    "title": str(item.get("title", "")).strip(),
+                    "updated_at": str(item.get("updated_at", "")).strip(),
+                    "url": str(item.get("url", "")).strip(),
+                }
+                for item in items
+                if isinstance(item, dict) and item.get("title") and item.get("updated_at")
+            ]
+        except (OSError, ValueError, TypeError):
+            self.subscription_items = []
+        self._rebuild_subscription_matches()
+
+    def _rebuild_subscription_matches(self) -> None:
+        self._subscription_item_ids = set()
+        self._subscription_update_by_item = {}
+        if not self.subscription_items:
+            return
+        for kind in ("tv", "movie"):
+            for row in self.store.list_items(kind):
+                for item in self.subscription_items:
+                    if titles_match(str(row["title"] or ""), item["title"]):
+                        self._subscription_item_ids.add(int(row["id"]))
+                        self._subscription_update_by_item[int(row["id"])] = item["updated_at"]
+                        break
+
+    def _subscription_rows(self, kind: str, rows: list[dict]) -> list[dict]:
+        """Fail closed: homepage data is empty until the subscription page syncs."""
+        return [row for row in rows if int(row["id"]) in self._subscription_item_ids]
+
+    def _home_rows_for_kind(self, kind: str) -> list[dict]:
+        rows = []
+        for item_id in self.items.get(kind, []):
+            row = self.store.get_item(item_id)
+            if row:
+                rows.append(row)
+        return self._subscription_rows(kind, rows)
+
+    def sync_subscriptions(self) -> None:
+        url = str(self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL) or DEFAULT_SUBSCRIPTION_URL)
+        dialog = SubscriptionSyncDialog(self, url, self.config.data_dir)
+        dialog.synced.connect(self._subscription_sync_done)
+        dialog.exec()
+
+    def _subscription_sync_done(self, items: object) -> None:
+        if not isinstance(items, list):
+            return
+        self.subscription_items = [
+            dict(item)
+            for item in items
+            if isinstance(item, dict) and item.get("title") and item.get("updated_at")
+        ]
+        self.config.subscription_cache_path.write_text(
+            json.dumps(
+                {"source": self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL), "items": self.subscription_items},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._rebuild_subscription_matches()
+        self._invalidate_home_cache(reset_recent_sort=True)
+        worker_running = bool(getattr(self, "worker", None) and self.worker.isRunning())
+        background_busy = worker_running or self.pool.activeThreadCount() > 0
+        if not background_busy:
+            self._start_douban()
+            self._start_tmdb()
+        if self.stack.currentIndex() == 0:
+            self._show_continue()
+        suffix = "" if not background_busy else "，当前后台任务完成后再更新元数据"
+        self.status_label.setText(
+            f"订阅已同步：{len(self.subscription_items)} 项，匹配媒体 {len(self._subscription_item_ids)} 部{suffix}"
+        )
+
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
@@ -668,6 +754,7 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("设置")
         management = QMenu(self)
         management.addAction("重新扫描", self.scan)
+        management.addAction("同步我的订阅", self.sync_subscriptions)
         management.addAction("整理模式", lambda: self._nav_changed(3))
         management.addAction("设置", lambda: self.stack.setCurrentIndex(3))
         menu.clicked.connect(lambda: management.popup(menu.mapToGlobal(menu.rect().bottomLeft())))
@@ -690,11 +777,11 @@ class MainWindow(QMainWindow):
         library_layout.setContentsMargins(32, 20, 32, 30)
         library_layout.setSpacing(18)
 
-        self.section_title = QLabel("继续观看")
+        self.section_title = QLabel("我的订阅")
         self.section_title.setObjectName("sectionTitle")
         self.section_title.setFont(role_font("title"))
         library_layout.addWidget(self.section_title)
-        self.section_subtitle = QLabel("从上次停下的地方继续播放")
+        self.section_subtitle = QLabel("只显示 dyjie.net 订阅中有更新的内容")
         self.section_subtitle.setObjectName("sectionSubtitle")
         library_layout.addWidget(self.section_subtitle)
 
@@ -910,7 +997,15 @@ class MainWindow(QMainWindow):
             return rows
 
         def entries(rows, subtitle):
-            return [(r["id"], r["title"], r["poster"] or "", subtitle) for r in rows[:18]]
+            return [
+                (
+                    r["id"],
+                    r["title"],
+                    r["poster"] or "",
+                    f"更新：{self._subscription_update_by_item.get(int(r['id']), subtitle)}",
+                )
+                for r in rows[:18]
+            ]
 
         tv_rows = rows_for("tv")
         movie_rows = rows_for("movie")
@@ -970,7 +1065,7 @@ class MainWindow(QMainWindow):
         if self._home_source_rows is None:
             self._refresh_library_art()
             self._home_source_rows = {
-                kind: [self.store.get_item(i) for i in self.items.get(kind, [])]
+                kind: self._home_rows_for_kind(kind)
                 for kind in ("tv", "movie")
             }
             self._home_source_rows = {
@@ -997,7 +1092,7 @@ class MainWindow(QMainWindow):
             # 首次进入才读取数据库、解析文件时间和刷新库入口图片。
             self._refresh_library_art()
             self._home_source_rows = {
-                kind: [self.store.get_item(i) for i in self.items.get(kind, [])]
+                kind: self._home_rows_for_kind(kind)
                 for kind in ("tv", "movie")
             }
             self._home_source_rows = {
@@ -1015,10 +1110,20 @@ class MainWindow(QMainWindow):
                 self._start_recent_sort()
 
         data = self._home_media_cache
+        if not self.subscription_items:
+            empty = QLabel("尚未同步订阅。请打开左上角菜单，选择“同步我的订阅”并登录 dyjie.net。")
+            empty.setStyleSheet("color: #9aa4b2; padding: 18px 0;")
+            self.home_rows.addWidget(empty)
+            return
+        if not self._subscription_item_ids:
+            empty = QLabel("订阅页有更新，但当前媒体库没有匹配条目。")
+            empty.setStyleSheet("color: #9aa4b2; padding: 18px 0;")
+            self.home_rows.addWidget(empty)
+            return
         if data["next"]:
             self.home_rows.addWidget(self._make_media_row("接下来", data["next"], card_type="continue"))
-        self.home_rows.addWidget(self._make_media_row("最近添加的电视剧", data["tv"]))
-        self.home_rows.addWidget(self._make_media_row("最近添加的电影", data["movie"]))
+        self.home_rows.addWidget(self._make_media_row("最近更新的电视剧", data["tv"]))
+        self.home_rows.addWidget(self._make_media_row("最近更新的电影", data["movie"]))
         self.home_rows.addWidget(self._make_media_row("高评分", data["rated"]))
 
     @staticmethod
@@ -1055,6 +1160,8 @@ class MainWindow(QMainWindow):
         result = []
         seen = set()
         for row, _series_ratio in self.store.continuing_items():
+            if int(row["id"]) not in self._subscription_item_ids:
+                continue
             files = self.store.list_files(row["id"])
             episodes = [f for f in files if f["episode"] is not None]
             episodes.sort(key=lambda f: (int(f["season"] or 1), int(f["episode"] or 0)))
@@ -1157,6 +1264,7 @@ class MainWindow(QMainWindow):
                     [f.episode for f in it.files],
                 )
                 self.items[kind].append(item_id)
+        self._rebuild_subscription_matches()
         self.status_label.setText(f"扫描完成：电视剧 {len(tv)} 部，电影 {len(movies)} 部，正在抓取豆瓣信息…")
         self._update_library_stats()
         self._start_douban()
@@ -1174,6 +1282,8 @@ class MainWindow(QMainWindow):
         todo = []
         for kind in ("tv", "movie"):
             for item_id in self.items[kind]:
+                if item_id not in self._subscription_item_ids:
+                    continue
                 row = self.store.get_item(item_id)
                 if row and not row["rating"] and self.config.get("douban_enabled", True):
                     todo.append((item_id, row["title"], kind, row["douban_id"] or None))
@@ -1206,6 +1316,8 @@ class MainWindow(QMainWindow):
         self._relation_handles = []
         for kind in ("tv", "movie"):
             for item_id in self.items.get(kind, []):
+                if item_id not in self._subscription_item_ids:
+                    continue
                 row = self.store.get_item(item_id)
                 if not row:
                     continue
@@ -1424,9 +1536,9 @@ class MainWindow(QMainWindow):
         # “接下来” is rendered as a home channel inside home_rows; keep the
         # legacy grid heading hidden so it cannot duplicate the channel title.
         self.continue_heading.setVisible(False)
-        self.section_title.setText("我的媒体")
-        self.section_subtitle.setText("")
-        self.section_subtitle.hide()
+        self.section_title.setText("我的订阅")
+        self.section_subtitle.setText("只显示 dyjie.net 订阅中有更新的内容")
+        self.section_subtitle.show()
         self._update_library_stats()
         self._populate_home()
         self.grid.clear()
@@ -2583,6 +2695,9 @@ class SettingsPage(QWidget):
         self.tv_root = QLineEdit(str(win.config.get("tv_root", "")))
         self.movie_root = QLineEdit(str(win.config.get("movie_root", "")))
         self.potplayer = QLineEdit(str(win.config.get("potplayer", "")))
+        self.subscription_url = QLineEdit(
+            str(win.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL))
+        )
         self.douban = QCheckBox("自动抓取豆瓣评分与海报")
         self.douban.setChecked(bool(win.config.get("douban_enabled", True)))
         self.delay = QSpinBox()
@@ -2592,6 +2707,7 @@ class SettingsPage(QWidget):
         form.addRow("电视剧目录", self.tv_root)
         form.addRow("电影目录", self.movie_root)
         form.addRow("PotPlayer 路径", self.potplayer)
+        form.addRow("订阅页 URL", self.subscription_url)
         form.addRow("", self.douban)
         form.addRow("豆瓣请求间隔(秒)", self.delay)
         lay.addLayout(form)
@@ -2610,6 +2726,7 @@ class SettingsPage(QWidget):
         cfg.set("tv_root", self.tv_root.text().strip())
         cfg.set("movie_root", self.movie_root.text().strip())
         cfg.set("potplayer", self.potplayer.text().strip())
+        cfg.set("subscription_url", self.subscription_url.text().strip() or DEFAULT_SUBSCRIPTION_URL)
         cfg.set("douban_enabled", self.douban.isChecked())
         cfg.set("request_delay", self.delay.value())
         self.win.client = DoubanClient(cfg.cache_dir, delay=float(self.delay.value()))

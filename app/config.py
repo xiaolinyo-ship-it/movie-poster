@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
     "tmdb_api_key": "",
     "request_delay": 0.8,
     "theme": "dark",
+    "subscription_url": "https://dyjie.net/user/rss/",
 }
 
 
@@ -28,6 +29,7 @@ class Config:
         self.db_path = self.data_dir / "library.db"
         self.config_path = self.base_dir / "config.json"
         self.undo_path = self.data_dir / "undo.log"
+        self.subscription_cache_path = self.data_dir / "subscriptions.json"
         for d in (self.data_dir, self.cache_dir, self.poster_dir, self.trash_dir):
             d.mkdir(parents=True, exist_ok=True)
         self.values = dict(DEFAULT_CONFIG)

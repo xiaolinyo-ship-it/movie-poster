@@ -9,6 +9,7 @@ MoviePoster（电影搜刮器）是一个面向 Windows 的本地优先影视媒
 - 处理豆瓣与 TMDB 元数据
 - 管理海报、背景图与人物/类型关系数据
 - Jellyfin 风格的首页与详情页展示
+- “我的订阅”首页：读取 dyjie.net 订阅页的“最近更新的影视”，只对匹配条目执行自动元数据更新
 - 收藏、观看状态、搜索与 Next Up（继续观看）
 - 调用 Windows PotPlayer 播放本地媒体
 - SQLite 本地数据库，媒体文件和数据库默认不上传到任何服务
@@ -32,6 +33,8 @@ python main.py
 ```
 
 首次运行后，在应用设置中配置电影/电视剧目录。仓库不会包含维护者的 NAS 地址、数据库、缓存、媒体文件或 API Key。
+
+在左上角菜单选择“同步我的订阅”后，首次需要在应用内登录 dyjie.net；MoviePoster 使用独立的 QtWebEngine 会话保存登录状态，不会把密码、Cookie 或令牌写入 `config.json`。同步结果只保存标题、更新时间和链接，用于过滤首页与自动更新范围。
 
 ## Build（构建 Windows 版本）
 
