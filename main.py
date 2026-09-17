@@ -20,7 +20,7 @@ def main() -> int:
     config = Config(base)
     store = Store(str(config.db_path))
     app = QApplication(sys.argv)
-    app.setApplicationName("小林影业")
+    app.setApplicationName("小林影视")
     win = MainWindow(config, store)
     win.show()
     code = app.exec()

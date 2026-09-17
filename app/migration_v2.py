@@ -73,6 +73,23 @@ def migrate_v2(conn: sqlite3.Connection) -> dict[str, int]:
                 FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS playback_conflicts(
+                file_id INTEGER PRIMARY KEY,
+                detected_at TEXT NOT NULL,
+                files_watched INTEGER,
+                playback_watched INTEGER,
+                files_progress REAL,
+                playback_progress REAL,
+                files_duration REAL,
+                playback_duration REAL,
+                files_state TEXT,
+                playback_state TEXT,
+                files_last_played_at TEXT,
+                playback_last_played_at TEXT,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+            )"""
+        )
         _add_column(conn, "files", "episode_id", "INTEGER")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_item ON episodes(item_id, season, episode)")
@@ -123,6 +140,32 @@ def migrate_v2(conn: sqlite3.Connection) -> dict[str, int]:
                       last_played_at, COALESCE(play_count, 0), updated_at
                FROM files"""
         )
+        # Keep an immutable first observation of legacy-vs-normalized playback
+        # conflicts.  The normalized playback row remains the read source, but
+        # an unknown historical disagreement is never silently overwritten.
+        conn.execute(
+            """INSERT OR IGNORE INTO playback_conflicts(
+                 file_id, detected_at,
+                 files_watched, playback_watched,
+                 files_progress, playback_progress,
+                 files_duration, playback_duration,
+                 files_state, playback_state,
+                 files_last_played_at, playback_last_played_at
+               )
+               SELECT f.id, COALESCE(p.updated_at, f.updated_at, datetime('now')),
+                      f.watched, p.watched,
+                      f.progress, p.progress,
+                      f.duration, p.duration,
+                      f.playback_state, p.playback_state,
+                      f.last_played_at, p.last_played_at
+               FROM files f
+               JOIN playback p ON p.file_id=f.id
+               WHERE COALESCE(f.watched, 0) != COALESCE(p.watched, 0)
+                  OR ABS(COALESCE(f.progress, 0) - COALESCE(p.progress, 0)) > 0.01
+                  OR ABS(COALESCE(f.duration, 0) - COALESCE(p.duration, 0)) > 0.01
+                  OR COALESCE(f.playback_state, 'never') != COALESCE(p.playback_state, 'never')
+                  OR COALESCE(f.last_played_at, '') != COALESCE(p.last_played_at, '')"""
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -134,6 +177,7 @@ def migrate_v2(conn: sqlite3.Connection) -> dict[str, int]:
         "paths": conn.execute("SELECT COUNT(DISTINCT path) FROM files").fetchone()[0],
         "episodes": conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
         "playback": conn.execute("SELECT COUNT(*) FROM playback").fetchone()[0],
+        "playback_conflicts": conn.execute("SELECT COUNT(*) FROM playback_conflicts").fetchone()[0],
         "linked_files": conn.execute("SELECT COUNT(*) FROM files WHERE episode_id IS NOT NULL").fetchone()[0],
     }
     return {f"before_{k}": v for k, v in before.items()} | {f"after_{k}": v for k, v in after.items()}

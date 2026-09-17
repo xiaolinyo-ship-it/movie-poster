@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import os
+import json
 import re
+import random
 import subprocess
 import time
+import ctypes
+import ctypes.wintypes as wintypes
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import (
     QModelIndex,
+    QPoint,
     QRect,
     QRectF,
     QSize,
@@ -22,6 +28,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QDesktopServices,
     QFont,
     QFontDatabase,
@@ -42,8 +49,10 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QDoubleSpinBox,
     QGraphicsBlurEffect,
     QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -72,6 +81,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 
@@ -79,6 +89,15 @@ from .config import Config
 from .douban import DoubanClient
 from .store import Store
 from .image_provider import ImageProviderManager
+from .subscription_dialog import SubscriptionAutoSync, SubscriptionSyncDialog
+from .subscriptions import (
+    DEFAULT_SUBSCRIPTION_URL,
+    _season_number,
+    subscription_poster_is_recent,
+    subscription_has_undownloaded_update,
+    subscription_update_timestamp,
+    titles_match,
+)
 from .workers import (
     ApplySubjectWorker,
     DoubanTask,
@@ -88,6 +107,7 @@ from .workers import (
     OrganizePlanWorker,
     RecentFilesWorker,
     ScanWorker,
+    SubscriptionHighResWorker,
     TmdbTask,
     TmdbSignals,
     TmdbLinkTask,
@@ -101,8 +121,8 @@ from .workers import (
 
 
 FONT_SYSTEM = {
-    # Jellyfin 首页频道标题使用中等字号与字重，避免管理后台式的大黑体。
-    "title": (24, QFont.DemiBold),
+    # 顶部“我的媒体”和首页频道标题使用同一套尺寸与字重。
+    "title": (15, QFont.DemiBold),
     "navigation": (14, QFont.Normal),
     "card": (14, QFont.Normal),
     "meta": (12, QFont.Normal),
@@ -175,8 +195,8 @@ QTableView, QTreeWidget, QTableWidget { background: #1b1f26; border: 1px solid #
 QHeaderView::section { background: #20242c; border: none; border-bottom: 1px solid #2d3340; padding: 8px; color: #9aa4b2; font-weight: 600; }
 QTableView::item, QTreeWidget::item, QTableWidget::item { padding: 6px; }
 QTableView::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected { background: #2b3a55; }
-QScrollBar:vertical { background: transparent; width: 10px; }
-QScrollBar::handle:vertical { background: #38414f; border-radius: 5px; min-height: 30px; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 0px; }
+QScrollBar::handle:vertical { background: rgba(170, 182, 201, 128); border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QProgressBar { background: #1f242c; border: none; border-radius: 4px; text-align: center; height: 12px; }
 QProgressBar::chunk { background: #3b82f6; border-radius: 4px; }
@@ -187,7 +207,7 @@ QFrame#hero { background: #1b2533; border: 1px solid #2b405e; border-radius: 10p
 QLabel#heroKicker { color: #8fb8ec; font-size: 11px; font-weight: 700; }
 QLabel#heroTitle { color: #f6f8fb; font-size: 21px; font-weight: 700; }
 QLabel#heroMeta { color: #aebbd0; font-size: 13px; }
-QLabel#sectionTitle { color: #f2f4f7; font-size: 24px; font-weight: 600; }
+QLabel#sectionTitle { color: #f2f4f7; font-size: 15px; font-weight: 600; }
 QLabel#sectionSubtitle { color: #8e99a8; font-size: 12px; }
 QLabel#stat { color: #8e99a8; font-size: 12px; }
 QLabel#statValue { color: #f2f4f7; font-size: 15px; font-weight: 700; }
@@ -221,7 +241,8 @@ class PosterDelegate(QStyledItemDelegate):
         self._pix_cache: dict[str, QPixmap] = {}
 
     def sizeHint(self, option, index):
-        return QSize(168, 252)
+        poster_height = _iphone_duo_poster_size(156)[1]
+        return QSize(168, poster_height + 12)
 
     def _pix(self, path: str) -> QPixmap | None:
         if not path or not os.path.exists(path):
@@ -230,7 +251,8 @@ class PosterDelegate(QStyledItemDelegate):
             pm = QPixmap(path)
             if not pm.isNull():
                 self._pix_cache[path] = pm.scaled(
-                    156, 216, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+                    156, _iphone_duo_poster_size(156)[1],
+                    Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
                 )
         return self._pix_cache.get(path)
 
@@ -248,9 +270,12 @@ class PosterDelegate(QStyledItemDelegate):
         hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
 
-        card = QRectF(rect.x() + 6, rect.y() + 6, 156, 240)
+        poster_width = 156
+        poster_height = _iphone_duo_poster_size(poster_width)[1]
+        radius = _iphone_duo_corner_radius(poster_width, poster_height)
+        card = QRectF(rect.x() + 6, rect.y() + 6, poster_width, poster_height)
         path = QPainterPath()
-        path.addRoundedRect(card, 8, 8)
+        path.addRoundedRect(card, radius, radius)
 
         if hover:
             painter.setPen(QPen(QColor("#4c8bf5"), 2))
@@ -407,7 +432,8 @@ class MediaLibraryCard(QFrame):
         super().__init__(parent)
         self.title = title
         self._pixmap = QPixmap()
-        self.setFixedSize(420, 236)
+        # 首页“我的媒体”两张入口海报按原比例缩小到原来的约三分之二。
+        self.setFixedSize(280, 157)
         self.setCursor(Qt.PointingHandCursor)
 
     def set_art(self, path: str):
@@ -423,7 +449,8 @@ class MediaLibraryCard(QFrame):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()), 8, 8)
+        radius = _home_poster_radius(self.width(), self.height())
+        path.addRoundedRect(QRectF(self.rect()), radius, radius)
         painter.setClipPath(path)
         painter.fillRect(self.rect(), QColor("#26313d"))
         if not self._pixmap.isNull():
@@ -444,8 +471,201 @@ class MediaLibraryCard(QFrame):
         painter.end()
 
 
-def _rounded_pixmap(pixmap: QPixmap, width: int, height: int, radius: float = 8.0) -> QPixmap:
+class _HoverMenu(QMenu):
+    """Popup menu that reports pointer exit so it can close predictably."""
+
+    entered = Signal()
+    left = Signal()
+
+    def enterEvent(self, event):
+        self.entered.emit()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.left.emit()
+        super().leaveEvent(event)
+
+
+class MediaCategoryTitle(QLabel):
+    """首页“我的媒体”标题及其悬停分类菜单。"""
+
+    category_clicked = Signal(str)
+    CATEGORIES = ("电视剧", "电影", "欧美剧", "韩国", "中国", "动画片", "演唱会", "科学")
+
+    def __init__(self, text: str = "我的媒体", parent=None):
+        super().__init__(text, parent)
+        self._menu_enabled = True
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+        self._menu = _HoverMenu(self)
+        self._menu.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._menu.setWindowFlag(Qt.FramelessWindowHint, True)
+        self._menu.setStyleSheet(
+            "QMenu { background: rgba(28, 28, 30, 232); "
+            "border: 1px solid rgba(255,255,255,46); border-radius: 13px; padding: 0; }"
+        )
+        # Avoid a per-hover graphics-effect repaint. The translucent surface
+        # and border provide the glass edge without making the popup feel late.
+        self._menu.setGraphicsEffect(None)
+        self._show_timer = QTimer(self)
+        self._show_timer.setSingleShot(True)
+        self._show_timer.setInterval(45)
+        self._show_timer.timeout.connect(self._show_menu_now)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(120)
+        self._hide_timer.timeout.connect(self._hide_menu_if_outside)
+        self._menu.entered.connect(self._hide_timer.stop)
+        self._menu.left.connect(self._hide_menu_later)
+        self._menu.aboutToHide.connect(self._show_timer.stop)
+        self._menu.aboutToHide.connect(self._hide_timer.stop)
+
+        panel = QFrame()
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.setStyleSheet("QFrame { background: transparent; }")
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(7, 7, 7, 7)
+        panel_layout.setSpacing(3)
+        action = QWidgetAction(self._menu)
+        action.setDefaultWidget(panel)
+        self._menu.addAction(action)
+
+        for category in self.CATEGORIES:
+            button = QPushButton(category, panel)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedHeight(24)
+            button.setFont(role_font("meta"))
+            button.setStyleSheet(
+                "QPushButton { background: rgba(255,255,255,13); "
+                "border: 1px solid rgba(255,255,255,26); border-radius: 8px; "
+                "padding: 0 8px; color: #f3f4f6; font-size: 10px; } "
+                "QPushButton:hover { background: rgba(255,255,255,34); "
+                "border-color: rgba(255,255,255,72); }"
+            )
+            button.clicked.connect(lambda _checked=False, name=category: self._activate(name))
+            panel_layout.addWidget(button)
+        # Build the popup geometry once. Repeated hover events reuse it.
+        self._menu.adjustSize()
+
+    def set_menu_enabled(self, enabled: bool) -> None:
+        self._menu_enabled = bool(enabled)
+        if not self._menu_enabled:
+            self._menu.hide()
+
+    def _activate(self, category: str) -> None:
+        self._menu.hide()
+        self.category_clicked.emit(category)
+
+    def _show_menu(self, immediate: bool = False) -> None:
+        if not self._menu_enabled:
+            return
+        if self._menu.isVisible():
+            return
+        if not immediate:
+            if not self._show_timer.isActive():
+                self._show_timer.start()
+            return
+        self._show_timer.stop()
+        self._show_menu_now()
+
+    def _show_menu_now(self) -> None:
+        if not self._menu_enabled or self._menu.isVisible():
+            return
+        # The title lives in the top navigation now. Anchor to that bar's
+        # bottom edge, not to the label's own baseline, so the glass menu never
+        # opens inside the navigation row or over the page title.
+        anchor = self.parentWidget()
+        bar = anchor.parentWidget() if anchor is not None else None
+        if bar is not None:
+            title_origin = self.mapToGlobal(QPoint(0, 0))
+            bar_bottom = bar.mapToGlobal(QPoint(0, bar.height() + 2))
+            point = QPoint(title_origin.x(), bar_bottom.y())
+        elif anchor is not None:
+            point = anchor.mapToGlobal(QPoint(0, anchor.height() + 2))
+        else:
+            point = self.mapToGlobal(QPoint(0, self.height() + 2))
+        screen = QApplication.screenAt(point)
+        if screen:
+            area = screen.availableGeometry()
+            x = max(area.left() + 8, min(point.x(), area.right() - self._menu.width() - 8))
+            y = min(point.y(), area.bottom() - self._menu.height() - 8)
+            point = QPoint(x, y)
+        self._menu.popup(point)
+
+    def _hide_menu_later(self) -> None:
+        if self._menu.isVisible():
+            self._hide_timer.start()
+
+    def _hide_menu_if_outside(self) -> None:
+        if not self._menu.isVisible():
+            return
+        cursor = QCursor.pos()
+        over_title = self.rect().contains(self.mapFromGlobal(cursor))
+        over_menu = self._menu.rect().contains(self._menu.mapFromGlobal(cursor))
+        if not over_title and not over_menu:
+            self._menu.hide()
+
+    def enterEvent(self, event):
+        self._show_menu()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        # Cancel a popup that has not opened yet.  If it is open, give the
+        # pointer a short bridge to the popup, then hide it when it leaves both
+        # the title and the menu.
+        self._show_timer.stop()
+        if self._menu.isVisible():
+            self._hide_menu_later()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._show_menu(immediate=True)
+        super().mousePressEvent(event)
+
+
+class ClickableLogo(QLabel):
+    """Top-left logo that always returns to the home page when clicked."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+def _home_poster_radius(width: int, height: int) -> int:
+    """按首页海报短边比例计算圆角，保持不同尺寸卡片的视觉比例一致。"""
+    # 普通首页竖版海报为 160px 宽、7px 圆角，作为统一视觉基准。
+    return max(4, round(min(width, height) * 7.0 / 160.0))
+
+
+IPHONE_DUO_SCREEN_RATIO = 2670 / 1878
+# 从用户提供的 iPhone Duo 图片测量：可见屏幕短边约 788px，角半径约 65px。
+IPHONE_DUO_CORNER_RATIO = 65 / 788
+
+
+def _iphone_duo_poster_size(width: int) -> tuple[int, int]:
+    """把竖版订阅海报按竖置 iPhone Duo 可见屏幕的长宽比换算。"""
+    return width, round(width * IPHONE_DUO_SCREEN_RATIO)
+
+
+def _iphone_duo_corner_radius(width: int, height: int) -> int:
+    """按 iPhone Duo 图片测得的圆角/短边比例计算圆角。"""
+    return max(4, round(min(width, height) * IPHONE_DUO_CORNER_RATIO))
+
+
+def _rounded_pixmap(pixmap: QPixmap, width: int, height: int, radius: float | None = None) -> QPixmap:
     """Clip artwork corners so a QPushButton icon cannot cover its rounding."""
+    if radius is None:
+        radius = _home_poster_radius(width, height)
     rounded = QPixmap(width, height)
     rounded.fill(Qt.transparent)
     painter = QPainter(rounded)
@@ -471,10 +691,11 @@ class ContinueWatchingCard(QWidget):
         button = QPushButton()
         button.setFixedSize(350, 196)
         button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet("QPushButton { border: 1px solid #2b3038; border-radius: 8px; background: #20252c; } QPushButton:hover { border: 2px solid #d7dde7; }")
+        radius = _home_poster_radius(350, 196)
+        button.setStyleSheet(f"QPushButton {{ border: 1px solid #2b3038; border-radius: {radius}px; background: #20252c; }} QPushButton:hover {{ border: 2px solid #d7dde7; }}")
         if poster and os.path.exists(poster):
             pix = win._cover_pixmap(poster, 350, 196)
-            button.setIcon(QIcon(_rounded_pixmap(pix, 350, 196, 8)))
+            button.setIcon(QIcon(_rounded_pixmap(pix, 350, 196, radius)))
             button.setIconSize(QSize(350, 196))
         else:
             button.setText(title[:16])
@@ -505,26 +726,28 @@ class PosterCard(QWidget):
 
     def __init__(self, win: "MainWindow", item_id: int, title: str, poster: str, subtitle: str = ""):
         super().__init__()
-        # Jellyfin 首页的竖版海报更克制，保持 2:3 比例并减少首屏拥挤。
+        # Jellyfin 首页普通竖版海报统一使用竖置 iPhone Duo 的比例。
         self.setFixedWidth(160)
+        poster_width, poster_height = _iphone_duo_poster_size(160)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(7)
         button = QPushButton()
-        button.setFixedSize(160, 240)
+        button.setFixedSize(poster_width, poster_height)
         button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet("QPushButton { border: 1px solid #2b3038; border-radius: 7px; background: #20252c; } QPushButton:hover { border: 2px solid #d7dde7; }")
+        radius = _iphone_duo_corner_radius(poster_width, poster_height)
+        button.setStyleSheet(f"QPushButton {{ border: 1px solid transparent; border-radius: {radius}px; background: transparent; }} QPushButton:hover {{ border: 2px solid #d7dde7; }}")
         if poster and os.path.exists(poster):
-            pix = win._cover_pixmap(poster, 160, 240)
-            button.setIcon(QIcon(pix))
-            button.setIconSize(QSize(160, 240))
+            pix = win._cover_pixmap(poster, poster_width, poster_height)
+            button.setIcon(QIcon(_rounded_pixmap(pix, poster_width, poster_height, radius)))
+            button.setIconSize(QSize(poster_width, poster_height))
         else:
             button.setText("暂无海报")
         button.clicked.connect(lambda: win._open_detail(item_id))
         layout.addWidget(button)
         name = QLabel(title)
         name.setFont(role_font("card"))
-        name.setMaximumWidth(160)
+        name.setMaximumWidth(poster_width)
         name.setWordWrap(False)
         name.setStyleSheet("color: #e3e3e3;")
         layout.addWidget(name)
@@ -535,10 +758,133 @@ class PosterCard(QWidget):
             layout.addWidget(meta)
 
 
+class _SubscriptionNewBadge(QLabel):
+    """Small yellow 45-degree NEW ribbon used only on subscription posters."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.rotate(45)
+        ribbon = QRectF(-32, -11, 64, 22)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#f5c542"))
+        painter.drawRoundedRect(ribbon, 5, 5)
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(12)
+        painter.setFont(font)
+        painter.setPen(QColor("#171717"))
+        painter.drawText(ribbon, Qt.AlignCenter, "NEW")
+        painter.end()
+        super().paintEvent(event)
+
+
+class SubscriptionCard(QWidget):
+    """Website-first subscription card with optional local media actions."""
+
+    def __init__(
+        self,
+        win: "MainWindow",
+        item_id: int | None,
+        title: str,
+        poster: str,
+        updated_at: str,
+        url: str,
+        website_status: str = "",
+        play_path: str = "",
+        play_resume: bool = False,
+        local_state: str = "not_downloaded",
+        has_new_update: bool = False,
+    ):
+        super().__init__()
+        poster_width, poster_height = _iphone_duo_poster_size(190)
+        self.setFixedSize(204, 390)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        poster_btn = QPushButton()
+        poster_btn.setFixedSize(poster_width, poster_height)
+        poster_btn.setCursor(Qt.PointingHandCursor)
+        radius = _iphone_duo_corner_radius(poster_width, poster_height)
+        poster_btn.setStyleSheet(
+            f"QPushButton {{ border: 1px solid transparent; border-radius: {radius}px; background: transparent; }} "
+            "QPushButton:hover { border: 2px solid #d7dde7; }"
+        )
+        if poster and os.path.exists(poster):
+            pix = win._cover_pixmap(poster, poster_width, poster_height)
+            poster_btn.setIcon(QIcon(_rounded_pixmap(pix, poster_width, poster_height, radius)))
+            poster_btn.setIconSize(QSize(poster_width, poster_height))
+        else:
+            poster_btn.setText("暂无海报")
+        if has_new_update:
+            badge = _SubscriptionNewBadge(poster_btn)
+            badge.setGeometry(poster_width - 72, -4, 76, 76)
+            badge.show()
+            badge.raise_()
+        # 订阅海报代表网站条目：点击在 MoviePoster 内打开 dyjie.net 详情页；
+        # 本地播放仍由下方“本地播放”按钮负责。
+        poster_btn.clicked.connect(lambda: win.open_subscription_page(url))
+        layout.addWidget(poster_btn)
+
+        name = QLabel(title)
+        name.setFont(role_font("card"))
+        name.setMaximumWidth(190)
+        name.setWordWrap(True)
+        name.setToolTip(title)
+        name.setStyleSheet("color: #e3e3e3;")
+        layout.addWidget(name)
+
+        updated = QLabel(updated_at)
+        updated.setFont(role_font("meta"))
+        updated.setStyleSheet("color: #9d9d9d;")
+        layout.addWidget(updated)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 14, 0)
+        actions.setSpacing(6)
+        view = QPushButton(website_status or "查看更新")
+        view.setToolTip("在 MoviePoster 内查看 dyjie.net 详情页")
+        view.setFixedHeight(28)
+        view.clicked.connect(lambda: win.open_subscription_page(url))
+        actions.addWidget(view, 1)
+
+        if local_state == "no_next":
+            local_text = "本地播放"
+            local_enabled = True
+        elif local_state == "available" and play_path:
+            local_text = "本地播放"
+            local_enabled = True
+        elif local_state == "inaccessible":
+            local_text = "路径不可访问"
+            local_enabled = False
+        else:
+            local_text = "还未下载"
+            local_enabled = False
+        local = QPushButton(local_text)
+        local.setFixedHeight(28)
+        local.setEnabled(local_enabled)
+        if local_state == "no_next":
+            local.clicked.connect(lambda: win._show_playback_message("本地暂无下一集"))
+        elif local_enabled:
+            local.clicked.connect(lambda: win.play(play_path, resume=play_resume))
+        actions.addWidget(local, 1)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Config, store: Store):
         super().__init__()
         self.font_family = configure_application_font(QApplication.instance())
+        self.logo_path = Path(__file__).resolve().parent.parent / "assets" / "MoviePoster.png"
+        if self.logo_path.exists():
+            self.setWindowIcon(QIcon(str(self.logo_path)))
         self.config = config
         self.store = store
         self.images = ImageProviderManager(store, config.cache_dir)
@@ -552,7 +898,7 @@ class MainWindow(QMainWindow):
         # what makes Next Up usable without embedding or replacing PotPlayer.
         self._play_sessions: list[dict] = []
         self._play_timer = QTimer(self)
-        self._play_timer.setInterval(5000)
+        self._play_timer.setInterval(1000)
         self._play_timer.timeout.connect(self._poll_play_sessions)
         self._play_timer.start()
         # 启动即从数据库加载已有条目，后台扫描完成后刷新
@@ -567,11 +913,24 @@ class MainWindow(QMainWindow):
         self._recent_sort_generation = 0
         self._recent_sort_keys = None
         self._recent_worker = None
-        self._poster_pixmap_cache: dict[tuple, QPixmap] = {}
+        self._subscription_hd_worker = None
+        self._poster_pixmap_cache: OrderedDict[tuple, QPixmap] = OrderedDict()
+        self._poster_pixmap_cache_limit = 256
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(lambda: self._search_all(self.search.text()))
         self._closing = False
         self._close_poll_scheduled = False
+        self.subscription_items: list[dict[str, str]] = []
+        self._subscription_item_ids: set[int] = set()
+        self._load_subscription_cache()
+        subscription_url = str(self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL) or DEFAULT_SUBSCRIPTION_URL)
+        self.subscription_auto_sync = SubscriptionAutoSync(self, subscription_url, self.config.data_dir)
+        self.subscription_auto_sync.synced.connect(self._subscription_sync_done)
+        self.subscription_auto_sync.status.connect(self._subscription_auto_status)
 
-        self.setWindowTitle("小林影业 · NAS")
+        self.setWindowTitle("小林影视 · NAS")
         self.resize(1180, 780)
         self.setMinimumSize(960, 640)
         self.setStyleSheet(DARK_QSS)
@@ -581,8 +940,428 @@ class MainWindow(QMainWindow):
         # work.  NAS scanning and the initial home refresh are both deferred.
         QTimer.singleShot(0, self._show_continue)
         QTimer.singleShot(0, self.scan)
+        QTimer.singleShot(0, self._start_subscription_hd_upgrade)
+        QTimer.singleShot(12000, self._auto_sync_subscriptions)
 
     # ---------- UI ----------
+    def _load_subscription_cache(self) -> None:
+        try:
+            data = json.loads(self.config.subscription_cache_path.read_text(encoding="utf-8"))
+            items = data.get("items", []) if isinstance(data, dict) else []
+            captured_at = self.config.subscription_cache_path.stat().st_mtime
+            migrated = False
+            self.subscription_items = []
+            for item in items:
+                if not isinstance(item, dict) or not item.get("title") or not item.get("updated_at"):
+                    continue
+                updated_at = str(item.get("updated_at", "")).strip()
+                updated_epoch = item.get("updated_at_epoch")
+                date_only = bool(item.get("updated_at_date_only", False))
+                try:
+                    updated_epoch = float(updated_epoch) if updated_epoch is not None else None
+                except (TypeError, ValueError):
+                    updated_epoch = None
+                if updated_epoch is None:
+                    updated_epoch, date_only = subscription_update_timestamp(updated_at, captured_at)
+                    migrated = True
+                self.subscription_items.append(
+                    {
+                        "title": str(item.get("title", "")).strip(),
+                        "updated_at": updated_at,
+                        "url": str(item.get("url", "")).strip(),
+                        "poster": str(item.get("poster", "")).strip(),
+                        "hd_poster": str(item.get("hd_poster", "")).strip(),
+                        "background": str(item.get("background", "")).strip(),
+                        "website_status": str(item.get("website_status", "")).strip(),
+                        "latest_season": item.get("latest_season"),
+                        "latest_episode": item.get("latest_episode"),
+                        "season_final": bool(item.get("season_final", False)),
+                        "updated_at_epoch": updated_epoch,
+                        "updated_at_date_only": date_only,
+                    }
+                )
+            purged = self._purge_stale_subscription_assets()
+            if migrated or purged:
+                self._save_subscription_cache()
+        except (OSError, ValueError, TypeError):
+            self.subscription_items = []
+        self._rebuild_subscription_matches()
+
+    def _save_subscription_cache(self) -> None:
+        self.config.subscription_cache_path.write_text(
+            json.dumps(
+                {
+                    "source": self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL),
+                    "items": self.subscription_items,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _purge_stale_subscription_assets(self) -> bool:
+        """Delete only this app's cached artwork for expired subscriptions."""
+        cache_roots = {
+            (self.config.cache_dir / name).resolve()
+            for name in ("posters", "backgrounds", "subscriptions")
+        }
+        changed = False
+        for item in self.subscription_items:
+            if self._subscription_item_is_recent(item):
+                continue
+            for key in ("poster", "hd_poster", "background"):
+                raw = str(item.get(key) or "").strip()
+                if not raw or raw.startswith(("http://", "https://")):
+                    continue
+                try:
+                    path = Path(raw).resolve()
+                    allowed = any(path.is_relative_to(root) for root in cache_roots)
+                except (OSError, RuntimeError, ValueError):
+                    allowed = False
+                    path = None
+                if not allowed or path is None:
+                    continue
+                if path.exists() and path.is_file():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        continue
+                if item.get(key):
+                    item[key] = ""
+                    changed = True
+        return changed
+
+    @staticmethod
+    def _subscription_item_is_recent(item: dict[str, str]) -> bool:
+        return subscription_poster_is_recent(
+            str(item.get("updated_at", "")),
+            item.get("updated_at_epoch"),
+            bool(item.get("updated_at_date_only", False)),
+        )
+
+    def _rebuild_subscription_matches(self) -> None:
+        self._subscription_item_ids = set()
+        if not self.subscription_items:
+            return
+        for item in self.subscription_items:
+            matched = self._subscription_local_match(str(item.get("title") or ""))
+            if matched and matched[0] is not None:
+                self._subscription_item_ids.add(int(matched[0]["id"]))
+
+    def _set_subscription_background(self) -> None:
+        candidates = [
+            str(item.get("background") or item.get("hd_poster") or item.get("poster", "")).strip()
+            for item in self.subscription_items
+            if self._subscription_item_is_recent(item)
+            and (item.get("background") or item.get("hd_poster") or item.get("poster"))
+            and os.path.exists(str(item.get("background") or item.get("hd_poster") or item.get("poster")))
+        ]
+        self._home_background_path = random.SystemRandom().choice(candidates) if candidates else ""
+        self._update_subscription_background()
+
+    def _start_subscription_hd_upgrade(self) -> None:
+        if not self.subscription_items or self._subscription_hd_worker is not None:
+            return
+        items = [dict(item) for item in self.subscription_items]
+        worker = SubscriptionHighResWorker(
+            items,
+            self.config.cache_dir,
+            str(self.config.get("tmdb_api_key", "") or ""),
+        )
+        worker.signals.done.connect(self._subscription_hd_done)
+        self._subscription_hd_worker = worker
+        self.pool.start(worker)
+
+    def _subscription_hd_done(self, items: object) -> None:
+        self._subscription_hd_worker = None
+        if not isinstance(items, list):
+            return
+        by_title = {
+            str(item.get("title") or "").strip(): {
+                "hd_poster": str(item.get("hd_poster") or "").strip(),
+                "background": str(item.get("background") or "").strip(),
+            }
+            for item in items
+            if isinstance(item, dict) and item.get("title")
+        }
+        changed = False
+        for item in self.subscription_items:
+            artwork = by_title.get(str(item.get("title") or "").strip(), {})
+            highres = artwork.get("hd_poster", "")
+            background = artwork.get("background", "")
+            if highres and item.get("hd_poster") != highres:
+                item["hd_poster"] = highres
+                changed = True
+            if background and item.get("background") != background:
+                item["background"] = background
+                changed = True
+        if not changed:
+            return
+        self.config.subscription_cache_path.write_text(
+            json.dumps(
+                {
+                    "source": self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL),
+                    "items": self.subscription_items,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._invalidate_home_cache(reset_recent_sort=False)
+        self._set_subscription_background()
+        if self.stack.currentIndex() == 0:
+            self._show_continue()
+        self.status_label.setText(f"订阅高清资源已更新：{len(by_title)} 项")
+
+    def _update_subscription_background(self) -> None:
+        background = getattr(self, "home_background", None)
+        if background is None or not self._home_background_path or not os.path.exists(self._home_background_path):
+            if background is not None:
+                background.hide()
+            return
+        width = max(1, self.library_page.width())
+        height = max(1, self.library_page.height())
+        background.setGeometry(self.library_page.rect())
+        background.setPixmap(self._cover_pixmap(self._home_background_path, width, height))
+        background.show()
+        background.lower()
+
+    def _subscription_local_match(self, title: str):
+        """Find local files for the exact subscribed work and season."""
+        source = self._home_source_rows
+        if source is None:
+            source = {
+                kind: list(self.store.list_items(kind))
+                for kind in ("tv", "movie")
+            }
+        requested_season = _season_number(title)
+        fallback = None
+        for rows in source.values():
+            for row in rows:
+                files = list(self.store.list_files(int(row["id"])))
+                # A library title can contain a provider spelling variant or a
+                # stale season-bearing metadata title.  Prefer the actual
+                # media path as an identity hint, then enforce the requested
+                # season below; never bind from the stale metadata alone.
+                candidates = [
+                    str(row["title"] or ""),
+                    str(row["original_title"] or "") if "original_title" in row.keys() else "",
+                    str(row["path"] or ""),
+                ]
+                candidates.extend(str(file_row["path"] or "") for file_row in files)
+                if not any(titles_match(candidate, title) for candidate in candidates if candidate):
+                    continue
+                if requested_season is None:
+                    if str(row["kind"] or "") != "movie":
+                        continue
+                    season_files = [f for f in files if int(f["season"] or 0) == 0]
+                else:
+                    if str(row["kind"] or "") != "tv":
+                        continue
+                    season_files = [
+                        f for f in files if int(f["season"] or 0) == requested_season
+                    ]
+                if season_files:
+                    return row, season_files
+                # Keep a same-title row so the UI can still report “还未下载”
+                # when the item exists but has no files for this season.
+                if not files:
+                    fallback = (row, [])
+        return fallback
+
+
+    @staticmethod
+    def _subscription_play_choice(files: list, requested_season: int | None):
+        """Return (state, path, resume) from one exact season's files."""
+        if not files:
+            return "not_downloaded", "", False
+        ordered = sorted(
+            files,
+            key=lambda f: (
+                int(f["episode"] or 0) if f["episode"] is not None else 0,
+                str(f["filename"] or ""),
+            ),
+        )
+        if requested_season is None:
+            # Movies have no next-episode transition; resume the last watched
+            # file when available, otherwise open the only/first file.
+            played = [f for f in ordered if f["last_played_at"] or f["progress"] or f["watched"]]
+            current = max(played, key=lambda f: str(f["last_played_at"] or "")) if played else ordered[0]
+            return "available", str(current["path"] or ""), bool(current["progress"] or current["watched"])
+
+        played = [
+            f for f in ordered
+            if f["last_played_at"] or f["progress"] or f["watched"] or f["playback_state"] == "finished"
+        ]
+        if not played:
+            return "available", str(ordered[0]["path"] or ""), False
+        current = max(
+            played,
+            key=lambda f: (str(f["last_played_at"] or ""), int(f["episode"] or 0)),
+        )
+        duration = float(current["duration"] or 0)
+        finished = bool(current["watched"] or current["playback_state"] == "finished")
+        if duration > 0:
+            finished = finished or float(current["progress"] or 0) >= duration * 0.95
+        if finished:
+            current_episode = int(current["episode"] or 0)
+            next_file = next(
+                (f for f in ordered if int(f["episode"] or 0) > current_episode),
+                None,
+            )
+            if next_file is None:
+                return "no_next", "", False
+            return "available", str(next_file["path"] or ""), False
+        return "available", str(current["path"] or ""), True
+
+    def _subscription_entries(self) -> list[tuple]:
+        """Build website-first rows; local rows only enrich actions/artwork."""
+        source = self._home_source_rows or {"tv": [], "movie": []}
+        result = []
+        seen_titles = set()
+        visible_items = [
+            (index, item)
+            for index, item in enumerate(self.subscription_items)
+            if self._subscription_item_is_recent(item)
+        ]
+        visible_items.sort(
+            key=lambda pair: (float(pair[1].get("updated_at_epoch") or 0), -pair[0]),
+            reverse=True,
+        )
+        for _, item in visible_items:
+            title = str(item.get("title") or "").strip()
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            matched = self._subscription_local_match(title)
+            matched_row, season_files = matched if matched else (None, [])
+            item_id = int(matched_row["id"]) if matched_row is not None else None
+            recent_update = self._subscription_item_is_recent(item)
+            local_poster = (
+                str(matched_row["poster"] or "")
+                if matched_row is not None and recent_update
+                else ""
+            )
+            synced_poster = str(item.get("hd_poster") or item.get("poster", "")).strip() if recent_update else ""
+            poster = synced_poster if synced_poster and os.path.exists(synced_poster) else local_poster
+            requested_season = _season_number(title)
+            local_state, play_path, play_resume = self._subscription_play_choice(
+                season_files, requested_season
+            )
+            has_new_update = subscription_has_undownloaded_update(
+                item, season_files, requested_season
+            )
+            result.append(
+                (
+                    item_id,
+                    title,
+                    poster,
+                    f"更新：{item['updated_at']}",
+                    str(item.get("url", "")),
+                    str(item.get("website_status") or ""),
+                    play_path,
+                    play_resume,
+                    local_state,
+                    has_new_update,
+                )
+            )
+        return result
+
+    def sync_subscriptions(self) -> None:
+        url = str(self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL) or DEFAULT_SUBSCRIPTION_URL)
+        self.subscription_auto_sync.stop()
+        dialog = SubscriptionSyncDialog(
+            self,
+            url,
+            self.config.data_dir,
+            profile=self.subscription_auto_sync.profile,
+        )
+        dialog.synced.connect(self._subscription_sync_done)
+        try:
+            dialog.exec()
+        finally:
+            if not self._closing:
+                QTimer.singleShot(1000, self._auto_sync_subscriptions)
+
+    def open_subscription_page(self, url: str = "") -> None:
+        """Show a dyjie page in MoviePoster and reuse the authenticated profile."""
+        if self._closing:
+            return
+        sync_url = str(
+            self.config.get("subscription_url", DEFAULT_SUBSCRIPTION_URL)
+            or DEFAULT_SUBSCRIPTION_URL
+        )
+        self.subscription_auto_sync.stop()
+        dialog = SubscriptionSyncDialog(
+            self,
+            sync_url,
+            self.config.data_dir,
+            profile=self.subscription_auto_sync.profile,
+            initial_url=str(url or sync_url),
+        )
+        dialog.synced.connect(self._subscription_sync_done)
+        try:
+            dialog.exec()
+        finally:
+            if not self._closing:
+                QTimer.singleShot(1000, self._auto_sync_subscriptions)
+
+    def _auto_sync_subscriptions(self) -> None:
+        if not self._closing:
+            self.subscription_auto_sync.sync()
+
+    def _subscription_auto_status(self, message: str) -> None:
+        if message.startswith("正在") or "失败" in message or "跳过" in message:
+            self.status_label.setText(message)
+
+    def _subscription_sync_done(self, items: object) -> None:
+        if not isinstance(items, list):
+            return
+        captured_at = time.time()
+        old_hd = {
+            str(item.get("title") or "").strip(): str(item.get("hd_poster") or "").strip()
+            for item in self.subscription_items
+        }
+        old_background = {
+            str(item.get("title") or "").strip(): str(item.get("background") or "").strip()
+            for item in self.subscription_items
+        }
+        self.subscription_items = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("title") or not item.get("updated_at"):
+                continue
+            updated = dict(item)
+            updated_epoch = updated.get("updated_at_epoch")
+            date_only = bool(updated.get("updated_at_date_only", False))
+            try:
+                updated_epoch = float(updated_epoch) if updated_epoch is not None else None
+            except (TypeError, ValueError):
+                updated_epoch = None
+            if updated_epoch is None:
+                updated_epoch, date_only = subscription_update_timestamp(
+                    str(updated.get("updated_at") or ""), captured_at
+                )
+            updated["updated_at_epoch"] = updated_epoch
+            updated["updated_at_date_only"] = date_only
+            if not updated.get("hd_poster") and old_hd.get(str(updated["title"]).strip()):
+                updated["hd_poster"] = old_hd[str(updated["title"]).strip()]
+            if not updated.get("background") and old_background.get(str(updated["title"]).strip()):
+                updated["background"] = old_background[str(updated["title"]).strip()]
+            self.subscription_items.append(updated)
+        self._purge_stale_subscription_assets()
+        self._save_subscription_cache()
+        self._rebuild_subscription_matches()
+        self._invalidate_home_cache(reset_recent_sort=True)
+        self._set_subscription_background()
+        if self.stack.currentIndex() == 0:
+            self._show_continue()
+        self._start_subscription_hd_upgrade()
+        self.status_label.setText(
+            f"订阅已同步：{len(self.subscription_items)} 项，匹配媒体 {len(self._subscription_item_ids)} 部"
+        )
+
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
@@ -608,12 +1387,17 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
         left_layout.addWidget(menu)
-        title = QLabel("小林影业")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #f2f4f7;")
-        left_layout.addWidget(title)
-        brand = QLabel("NAS")
-        brand.setStyleSheet("font-size: 10px; color: #6f7f94; letter-spacing: 1px;")
-        left_layout.addWidget(brand)
+        logo = ClickableLogo()
+        logo.setObjectName("appLogo")
+        logo.setFixedSize(30, 30)
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setToolTip("小林影视")
+        logo.clicked.connect(self._show_continue)
+        if self.logo_path.exists():
+            pixmap = QPixmap(str(self.logo_path))
+            logo.setPixmap(pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.app_logo = logo
+        left_layout.addWidget(logo)
         left_layout.addStretch(1)
         tl.addWidget(left_bar, 0, 0, Qt.AlignVCenter | Qt.AlignLeft)
         self.home_btn = QPushButton("首页")
@@ -638,6 +1422,18 @@ class MainWindow(QMainWindow):
         nav_layout.setSpacing(8)
         for nav_btn in (self.home_btn, self.favorite_btn):
             nav_layout.addWidget(nav_btn)
+        self.section_title = MediaCategoryTitle("我的媒体")
+        self.section_title.setObjectName("topMediaMenu")
+        self.section_title.setStyleSheet(
+            "QLabel#topMediaMenu { color: #f2f4f7; font-size: 15px; font-weight: 600; "
+            "padding: 3px 7px; border-radius: 7px; } "
+            "QLabel#topMediaMenu:hover { background: rgba(255,255,255,22); color: #ffffff; }"
+        )
+        self.section_title.category_clicked.connect(self._handle_media_category)
+        nav_layout.addWidget(self.section_title, 0, Qt.AlignVCenter)
+        # 首页内容承担频道展示；顶部只保留媒体菜单，隐藏旧的按钮式导航。
+        self.home_btn.hide()
+        self.favorite_btn.hide()
         self.detail_back_btn.setStyleSheet(
             "QPushButton#topNav { border: 1px solid #394351; border-radius: 8px; "
             "padding: 8px 16px; color: #d8dee8; background: #252b34; } "
@@ -656,6 +1452,8 @@ class MainWindow(QMainWindow):
         self.search_completer = QCompleter(self)
         self.search_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self.search_completer.setFilterMode(Qt.MatchContains)
+        self.search_suggestion_model = QStandardItemModel(self.search_completer)
+        self.search_completer.setModel(self.search_suggestion_model)
         self.search.setCompleter(self.search_completer)
         right_layout.addWidget(self.search)
         self.status_label = QLabel("就绪")
@@ -668,6 +1466,7 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("设置")
         management = QMenu(self)
         management.addAction("重新扫描", self.scan)
+        management.addAction("同步我的订阅", self.sync_subscriptions)
         management.addAction("整理模式", lambda: self._nav_changed(3))
         management.addAction("设置", lambda: self.stack.setCurrentIndex(3))
         menu.clicked.connect(lambda: management.popup(menu.mapToGlobal(menu.rect().bottomLeft())))
@@ -685,29 +1484,31 @@ class MainWindow(QMainWindow):
 
         # Jellyfin 风格的媒体库工作区：页面头部 + 统计横幅 + 海报网格
         self.library_page = QWidget()
-        self.library_page.setStyleSheet("background-color: #101010;")
+        self.library_page.setStyleSheet("background: transparent;")
+        self.home_background = QLabel(self.library_page)
+        self.home_background.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.home_background.setStyleSheet("background: transparent;")
+        opacity = QGraphicsOpacityEffect(self.home_background)
+        opacity.setOpacity(0.22)
+        self.home_background.setGraphicsEffect(opacity)
+        self.home_background.lower()
+        self._home_background_path = ""
         library_layout = QVBoxLayout(self.library_page)
         library_layout.setContentsMargins(32, 20, 32, 30)
         library_layout.setSpacing(18)
 
-        self.section_title = QLabel("继续观看")
-        self.section_title.setObjectName("sectionTitle")
-        self.section_title.setFont(role_font("title"))
-        library_layout.addWidget(self.section_title)
         self.section_subtitle = QLabel("从上次停下的地方继续播放")
         self.section_subtitle.setObjectName("sectionSubtitle")
         library_layout.addWidget(self.section_subtitle)
 
-        self.tv_library_btn = MediaLibraryCard("电视剧")
-        self.movie_library_btn = MediaLibraryCard("电影")
-
         self.home_panel = QWidget()
+        self.home_panel.setStyleSheet("background: transparent;")
         self.home_layout = QVBoxLayout(self.home_panel)
         self.home_layout.setContentsMargins(0, 4, 0, 0)
-        # V13：媒体库入口紧跟“我的媒体”标题，避免首屏出现大块空白。
+        # 首页不再展示两张媒体库入口海报，分类入口改为标题悬停菜单。
         self.home_layout.setSpacing(0)
-        self.home_layout.addLayout(self._home_library_row())
         self.home_rows_widget = QWidget()
+        self.home_rows_widget.setStyleSheet("background: transparent;")
         self.home_rows = QVBoxLayout(self.home_rows_widget)
         self.home_rows.setContentsMargins(0, 0, 0, 0)
         self.home_rows.setSpacing(20)
@@ -716,6 +1517,7 @@ class MainWindow(QMainWindow):
         self.home_rows_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.home_rows_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._install_cinema_scrollbar(self.home_rows_scroll)
+        self.home_rows_scroll.viewport().setStyleSheet("background: transparent;")
         self.home_rows_scroll.setWidget(self.home_rows_widget)
         self.home_layout.addWidget(self.home_rows_scroll)
         library_layout.addWidget(self.home_panel, 1)
@@ -769,8 +1571,6 @@ class MainWindow(QMainWindow):
         self.home_btn.clicked.connect(self._show_continue)
         self.favorite_btn.clicked.connect(lambda: self.nav.setCurrentRow(0))
         self.detail_back_btn.clicked.connect(self._back_to_grid)
-        self.tv_library_btn.clicked.connect(lambda: self.nav.setCurrentRow(1))
-        self.movie_library_btn.clicked.connect(lambda: self.nav.setCurrentRow(2))
         # 菜单按钮现在只打开后台入口菜单，影院导航始终保持简洁。
 
     def _stat_block(self, label: str, value: str) -> QWidget:
@@ -787,15 +1587,16 @@ class MainWindow(QMainWindow):
         return block
 
     def _home_library_row(self) -> QVBoxLayout:
-        row = QVBoxLayout()
-        row.setSpacing(8)
-        cards = QHBoxLayout()
-        cards.setSpacing(28)
-        for button in (self.tv_library_btn, self.movie_library_btn):
-            cards.addWidget(button)
-        cards.setAlignment(Qt.AlignLeft)
-        row.addLayout(cards)
-        return row
+        # Kept as a compatibility hook for older callers; the two entry cards
+        # were intentionally replaced by the top navigation category menu.
+        return QVBoxLayout()
+
+    def _handle_media_category(self, category: str) -> None:
+        """保留已有电视剧/电影入口行为；其他分类先作为菜单展示项。"""
+        if category == "电视剧":
+            self._show_kind("tv")
+        elif category == "电影":
+            self._show_kind("movie")
 
     @staticmethod
     def _install_cinema_scrollbar(scroll: QScrollArea) -> None:
@@ -834,6 +1635,7 @@ class MainWindow(QMainWindow):
         key = (path, width, height, stamp)
         cached = self._poster_pixmap_cache.get(key)
         if cached is not None:
+            self._poster_pixmap_cache.move_to_end(key)
             return cached
         source = QPixmap(path)
         scaled = source.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
@@ -841,26 +1643,48 @@ class MainWindow(QMainWindow):
         top = max(0, (scaled.height() - height) // 2)
         result = scaled.copy(left, top, width, height)
         self._poster_pixmap_cache[key] = result
+        self._poster_pixmap_cache.move_to_end(key)
+        while len(self._poster_pixmap_cache) > self._poster_pixmap_cache_limit:
+            self._poster_pixmap_cache.popitem(last=False)
         return result
 
     def _make_media_row(self, title: str, entries: list[tuple], card_type: str = "poster") -> QWidget:
         section = QWidget()
+        section.setStyleSheet("background: transparent;")
         outer = QVBoxLayout(section)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(12)
         heading = QLabel(title + "  ›")
         heading.setObjectName("sectionTitle")
         heading.setFont(role_font("title"))
-        outer.addWidget(heading)
+        accent_titles = {"我的订阅", "最近添加的电视剧", "最近添加的电影", "高评分"}
+        if title in accent_titles:
+            heading_row = QWidget()
+            heading_layout = QHBoxLayout(heading_row)
+            heading_layout.setContentsMargins(0, 0, 0, 0)
+            heading_layout.setSpacing(9)
+            accent = QFrame()
+            accent.setObjectName("sectionAccent")
+            accent.setFixedWidth(4)
+            accent.setFixedHeight(max(1, heading.sizeHint().height()))
+            accent.setStyleSheet("QFrame#sectionAccent { background: #f4c542; border-radius: 2px; }")
+            heading_layout.addWidget(accent, 0, Qt.AlignVCenter)
+            heading_layout.addWidget(heading)
+            outer.addWidget(heading_row)
+        else:
+            outer.addWidget(heading)
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
         is_continue = card_type == "continue"
-        row_height = 280 if is_continue else 320
+        is_subscription = card_type == "subscription"
+        row_height = 280 if is_continue else (410 if is_subscription else 320)
         scroll.setFixedHeight(row_height)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.viewport().setStyleSheet("background: transparent;")
         content = QWidget()
+        content.setStyleSheet("background: transparent;")
         line = QHBoxLayout(content)
         line.setContentsMargins(0, 0, 0, 0)
         line.setSpacing(18)
@@ -870,12 +1694,34 @@ class MainWindow(QMainWindow):
                 ratio = float(entry[4]) if len(entry) > 4 else 0.0
                 play_path = str(entry[5]) if len(entry) > 5 else ""
                 line.addWidget(ContinueWatchingCard(self, item_id, name, poster, subtitle, ratio, play_path))
+            elif is_subscription:
+                url = str(entry[4]) if len(entry) > 4 else ""
+                website_status = str(entry[5]) if len(entry) > 5 else ""
+                play_path = str(entry[6]) if len(entry) > 6 else ""
+                play_resume = bool(entry[7]) if len(entry) > 7 else False
+                local_state = str(entry[8]) if len(entry) > 8 else "not_downloaded"
+                has_new_update = bool(entry[9]) if len(entry) > 9 else False
+                line.addWidget(
+                    SubscriptionCard(
+                        self,
+                        item_id,
+                        name,
+                        poster,
+                        subtitle,
+                        url,
+                        website_status,
+                        play_path,
+                        play_resume,
+                        local_state,
+                        has_new_update,
+                    )
+                )
             else:
                 line.addWidget(PosterCard(self, item_id, name, poster, subtitle))
         line.addStretch(1)
-        card_width = 368 if is_continue else 178
+        card_width = 368 if is_continue else (222 if is_subscription else 178)
         content.setFixedWidth(max(card_width, len(entries) * card_width + 20))
-        content.setFixedHeight(280 if is_continue else 274)
+        content.setFixedHeight(390 if is_subscription else (280 if is_continue else 274))
         scroll.setWidget(content)
         outer.addWidget(scroll)
         # Keep the section from being compressed by the parent home layout.  In
@@ -920,7 +1766,7 @@ class MainWindow(QMainWindow):
             reverse=True,
         )
         return {
-            "next": self._next_up_entries(),
+            "subscriptions": self._subscription_entries(),
             "tv": entries(tv_rows, "电视剧"),
             "movie": entries(movie_rows, "电影"),
             "rated": [
@@ -1015,8 +1861,19 @@ class MainWindow(QMainWindow):
                 self._start_recent_sort()
 
         data = self._home_media_cache
-        if data["next"]:
-            self.home_rows.addWidget(self._make_media_row("接下来", data["next"], card_type="continue"))
+        if data["subscriptions"]:
+            self.home_rows.addWidget(
+                self._make_media_row("我的订阅", data["subscriptions"], card_type="subscription")
+            )
+        else:
+            message = (
+                "尚未同步订阅。请打开左上角菜单，选择“同步我的订阅”并登录 dyjie.net。"
+                if not self.subscription_items
+                else "订阅页有更新，但当前媒体库没有匹配条目。"
+            )
+            empty = QLabel(f"我的订阅：{message}")
+            empty.setStyleSheet("color: #9aa4b2; padding: 18px 0;")
+            self.home_rows.addWidget(empty)
         self.home_rows.addWidget(self._make_media_row("最近添加的电视剧", data["tv"]))
         self.home_rows.addWidget(self._make_media_row("最近添加的电影", data["movie"]))
         self.home_rows.addWidget(self._make_media_row("高评分", data["rated"]))
@@ -1083,27 +1940,16 @@ class MainWindow(QMainWindow):
         return result
 
     def _refresh_library_art(self):
-        """Jellyfin-style library tile art: prefer backdrop/fanart over poster."""
-        for kind, button in (("tv", self.tv_library_btn), ("movie", self.movie_library_btn)):
-            candidates = []
-            for item_id in self.items.get(kind, []):
-                row = self.store.get_item(item_id)
-                if not row:
-                    continue
-                for key in ("backdrop", "fanart", "poster"):
-                    try:
-                        value = row[key]
-                    except Exception:
-                        value = None
-                    if value and os.path.exists(value):
-                        candidates.append(value)
-                        break
-            button.set_art(candidates[0] if candidates else "")
+        """Refresh home artwork without relying on the removed library cards."""
+        # The home entry cards are no longer part of the page; their artwork
+        # refresh used to abort the whole home population after the cards were
+        # removed.  Subscription background selection is handled separately.
+        return
 
     def _connect(self):
         self.nav.currentRowChanged.connect(self._nav_changed)
         self.search.textChanged.connect(self._update_search_suggestions)
-        self.search.textChanged.connect(self._search_all)
+        self.search.textChanged.connect(self._queue_search)
         self.refresh_btn.clicked.connect(self.scan)
         self.settings_btn.clicked.connect(lambda: self.stack.setCurrentIndex(3))
         self.grid.activated_item.connect(self._open_detail)
@@ -1119,15 +1965,12 @@ class MainWindow(QMainWindow):
             return
         tv_root = self.config.get("tv_root")
         movie_root = self.config.get("movie_root")
-        if not tv_root or not os.path.isdir(tv_root) or not os.path.isdir(movie_root):
-            self.status_label.setText("NAS 路径不可访问，请在设置中检查")
-            QMessageBox.warning(self, "路径错误", "NAS 目录不可访问，请到设置里确认路径。")
-            return
         self.refresh_btn.setEnabled(False)
-        self.status_label.setText("正在扫描 NAS 媒体库（首次约 40 秒），完成后自动刷新…")
+        self.status_label.setText("正在后台扫描 NAS 媒体库，界面仍可浏览…")
         self.worker = ScanWorker(tv_root, movie_root)
         self.worker.progress.connect(self.status_label.setText)
         self.worker.finished_scan.connect(self._scan_done)
+        self.worker.cancelled.connect(self._scan_cancelled)
         self.worker.error.connect(lambda e: self._scan_error(e))
         self.worker.start()
 
@@ -1135,29 +1978,42 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"扫描失败：{msg}")
 
+    def _scan_cancelled(self):
+        self.refresh_btn.setEnabled(True)
+        if not self._closing:
+            self.status_label.setText("扫描已取消，保留原有媒体记录")
+
     def _scan_done(self):
         worker = self.worker
         tv = list(getattr(worker, "tv_items", ()))
         movies = list(getattr(worker, "movie_items", ()))
+        tv_errors = list(getattr(worker, "tv_errors", ()))
+        movie_errors = list(getattr(worker, "movie_errors", ()))
         self.refresh_btn.setEnabled(True)
         self._invalidate_home_cache(reset_recent_sort=True)
         self.tv_items = tv
         self.movie_items = movies
         was_detail = self.stack.currentIndex() == 1
         # 入库
-        for kind, items in (("tv", tv), ("movie", movies)):
-            self.items[kind] = []
+        for kind, items, errors in (("tv", tv, tv_errors), ("movie", movies, movie_errors)):
+            old_ids = list(self.items.get(kind, ()))
+            scanned_ids = []
             for it in items:
                 item_id = self.store.upsert_item(kind, it.title, it.path)
-                self.store.replace_files(
-                    item_id,
-                    [f.path for f in it.files],
-                    [f.name for f in it.files],
-                    [f.season for f in it.files],
-                    [f.episode for f in it.files],
-                )
-                self.items[kind].append(item_id)
-        self.status_label.setText(f"扫描完成：电视剧 {len(tv)} 部，电影 {len(movies)} 部，正在抓取豆瓣信息…")
+                if it.scan_complete and not errors:
+                    self.store.replace_files(
+                        item_id,
+                        [f.path for f in it.files],
+                        [f.name for f in it.files],
+                        [f.season for f in it.files],
+                        [f.episode for f in it.files],
+                    )
+                scanned_ids.append(item_id)
+            self.items[kind] = list(dict.fromkeys(old_ids + scanned_ids)) if errors else scanned_ids
+        self._rebuild_subscription_matches()
+        issue_count = len(tv_errors) + len(movie_errors)
+        suffix = f"；读取问题 {issue_count} 项，旧记录已保留" if issue_count else ""
+        self.status_label.setText(f"扫描完成：电视剧 {len(tv)} 部，电影 {len(movies)} 部{suffix}，正在抓取豆瓣信息…")
         self._update_library_stats()
         self._start_douban()
         self._start_tmdb()
@@ -1369,10 +2225,9 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
         self.home_panel.setVisible(False)
         self.grid.setVisible(True)
-        self.tv_library_btn.setVisible(False)
-        self.movie_library_btn.setVisible(False)
         self.continue_heading.setVisible(False)
-        self.section_title.setText(f"搜索结果：{keyword}")
+        self.section_title.set_menu_enabled(True)
+        self.section_title.setText("我的媒体")
         self.section_subtitle.setText("电影和电视剧")
         self.grid.clear()
         for row in self.store.search_all(keyword):
@@ -1386,17 +2241,23 @@ class MainWindow(QMainWindow):
                 row["poster"] or "", False, False,
             )
 
+    def _queue_search(self, _text: str = ""):
+        if not self._closing:
+            self._search_timer.start()
+
     def _update_search_suggestions(self, text: str):
         suggestions = self.store.search_suggestions(text)
-        model = QStandardItemModel(self.search_completer)
+        model = self.search_suggestion_model
+        model.clear()
         for value in suggestions:
             model.appendRow(QStandardItem(value))
-        self.search_completer.setModel(model)
 
     # ---------- 导航 ----------
     def _set_detail_navigation(self, active: bool):
         """Keep the shared top bar consistent across library and detail views."""
         self.detail_back_btn.setVisible(active)
+        self.section_title.set_menu_enabled(True)
+        self.section_title.setText("我的媒体")
         self.home_btn.setChecked(not active and self.current_kind == "continue")
         self.favorite_btn.setChecked(False)
 
@@ -1419,8 +2280,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
         self.home_panel.setVisible(True)
         self.grid.setVisible(False)
-        self.tv_library_btn.setVisible(True)
-        self.movie_library_btn.setVisible(True)
+        self.section_title.set_menu_enabled(True)
+        if not self._home_background_path:
+            self._set_subscription_background()
+        else:
+            self._update_subscription_background()
         # “接下来” is rendered as a home channel inside home_rows; keep the
         # legacy grid heading hidden so it cannot duplicate the channel title.
         self.continue_heading.setVisible(False)
@@ -1431,6 +2295,7 @@ class MainWindow(QMainWindow):
         self._populate_home()
         self.grid.clear()
         self.search.clear()
+        self._search_timer.stop()
 
     def _show_kind(self, kind: str):
         self.current_kind = kind
@@ -1438,11 +2303,11 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(0)
         self.home_panel.setVisible(False)
         self.grid.setVisible(True)
-        self.tv_library_btn.setVisible(False)
-        self.movie_library_btn.setVisible(False)
+        self.home_background.hide()
+        self.section_title.set_menu_enabled(True)
         self.continue_heading.setVisible(False)
         label = "电视剧" if kind == "tv" else "电影"
-        self.section_title.setText(label)
+        self.section_title.setText("我的媒体")
         self.section_subtitle.setText("按海报浏览，双击进入详情")
         self.section_subtitle.show()
         self.hero_title.setText(f"{label}库")
@@ -1475,45 +2340,136 @@ class MainWindow(QMainWindow):
     def _open_detail(self, item_id: int):
         self._previous_stack_index = self.stack.currentIndex()
         self._previous_kind = self.current_kind
+        self.section_title.set_menu_enabled(True)
+        self.section_title.setText("我的媒体")
         self.detail.load(item_id)
         self._set_detail_navigation(True)
         self.stack.setCurrentIndex(1)
+
+    def _show_playback_message(self, message: str) -> None:
+        QMessageBox.information(self, "播放提示", message)
+
+    @staticmethod
+    def _potplayer_window_handles(process_id: int | None = None) -> list[int]:
+        """Find PotPlayer top-level windows, preferring the launched process."""
+        if os.name != "nt":
+            return []
+        user32 = ctypes.windll.user32
+        handles: list[tuple[int, int]] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            name = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, name, len(name))
+            if "potplayer" not in name.value.casefold():
+                return True
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            handles.append((int(hwnd), int(owner.value)))
+            return True
+
+        user32.EnumWindows(callback, 0)
+        preferred = [hwnd for hwnd, owner in handles if process_id and owner == process_id]
+        return preferred or [hwnd for hwnd, _owner in handles]
+
+    @classmethod
+    def _query_potplayer_position(cls, session: dict) -> tuple[float | None, float | None]:
+        """Read real PotPlayer position/duration through its WM_USER API."""
+        handles = cls._potplayer_window_handles(
+            getattr(session.get("process"), "pid", None)
+        )
+        if not handles or os.name != "nt":
+            return None, None
+        user32 = ctypes.windll.user32
+        user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+
+        def command(hwnd: int, code: int) -> int | None:
+            result = ctypes.c_size_t()
+            ok = user32.SendMessageTimeoutW(
+                hwnd,
+                0x0400,  # WM_USER
+                code,
+                0,
+                0x0002,  # SMTO_ABORTIFHUNG
+                200,
+                ctypes.byref(result),
+            )
+            return int(result.value) if ok else None
+
+        for hwnd in handles:
+            raw_position = command(hwnd, 0x5004)
+            raw_duration = command(hwnd, 0x5002)
+            if raw_position is None or raw_duration is None or raw_duration <= 0:
+                continue
+            known_duration = float(session.get("duration") or 0)
+            scales = (1.0, 0.001, 0.000001, 0.01)
+            if known_duration > 0:
+                scale = min(scales, key=lambda value: abs(raw_duration * value - known_duration))
+            else:
+                scale = 0.001 if raw_duration > 100000 else 1.0
+            duration = max(0.0, raw_duration * scale)
+            position = max(0.0, raw_position * scale)
+            if duration > 0:
+                position = min(position, duration)
+            session["potplayer_hwnd"] = hwnd
+            return position, duration
+        return None, None
+
+    @staticmethod
+    def _seek_argument(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"/seek={hours:02d}:{minutes:02d}:{secs:02d}"
 
     def play(self, path: str, resume: bool = False):
         pot = self.config.get("potplayer")
         if not pot or not os.path.exists(pot):
             QMessageBox.warning(self, "播放器缺失", "找不到 PotPlayer，请在设置里指定播放器路径。")
-            return
+            return False
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "路径不可访问", "NAS 路径暂时不可访问，无法判断本地文件是否可播放。")
+            return False
+        file_row = self.store.get_file(path)
+        previous = float(file_row["progress"] or 0) if file_row else 0.0
+        duration = float(file_row["duration"] or 0) if file_row else 0.0
+        if duration <= 0:
+            duration = self._probe_duration(path)
         cmd = [pot]
-        if resume:
-            f = self.store.get_file(path)
-            if f and f["progress"] > 0:
-                cmd.append(f"/seek={int(f['progress'])}")
+        if resume and previous > 0:
+            cmd.append(self._seek_argument(previous))
         cmd.append(path)
         try:
             process = subprocess.Popen(cmd)
-            file_row = self.store.get_file(path)
-            previous = float(file_row["progress"] or 0) if file_row else 0.0
-            duration = float(file_row["duration"] or 0) if file_row else 0.0
-            if duration <= 0:
-                duration = self._probe_duration(path)
-            # A launch is a real viewing interaction. Persist a small positive
-            # position immediately, then refine it while PotPlayer is running.
-            # This also works when PotPlayer is closed before its first poll.
-            start_position = previous if previous > 0 else 1.0
-            if duration > 0 and start_position >= duration:
-                start_position = max(0.5, duration * 0.01)
-            self.store.update_play_state(path, "in_progress", start_position, duration or None)
+            # Never invent a positive position. The timer will replace this
+            # value with PotPlayer's actual WM_USER position when available.
+            self.store.update_play_state(path, "in_progress", previous, duration or None)
             self.store.update_last_played(path)
             self._play_sessions.append({
                 "process": process,
                 "path": path,
-                "started": time.monotonic(),
-                "base": start_position,
+                "base": previous,
                 "duration": duration,
             })
+            # Hand focus to PotPlayer and keep the library window out of the
+            # way.  Only minimize after Popen succeeds, so failed playback
+            # attempts leave the diagnostic dialog visible.
+            self.showMinimized()
+            return True
         except Exception as e:
             QMessageBox.warning(self, "播放失败", str(e))
+            return False
 
     @staticmethod
     def _probe_duration(path: str) -> float:
@@ -1533,12 +2489,17 @@ class MainWindow(QMainWindow):
         home_changed = False
         for session in self._play_sessions:
             process = session["process"]
-            elapsed = max(0.0, time.monotonic() - session["started"])
             duration = float(session.get("duration") or 0)
-            position = session["base"] + elapsed
+            live_position, live_duration = self._query_potplayer_position(session)
+            if live_duration and live_duration > 0:
+                duration = live_duration
+                session["duration"] = live_duration
+            position = float(live_position) if live_position is not None else float(session.get("base") or 0)
             if duration > 0:
                 position = min(position, duration)
-            finished = duration > 0 and position >= duration * 0.95
+            if live_position is not None:
+                session["base"] = position
+            finished = duration > 0 and position >= duration * 0.95 and live_position is not None
             try:
                 process_done = process.poll() is not None
             except Exception:
@@ -1558,6 +2519,10 @@ class MainWindow(QMainWindow):
             self._invalidate_home_cache()
             self._show_continue()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_subscription_background()
+
     def closeEvent(self, event):
         # Do not destroy the window while either managed QThread is still
         # running.  Scan code may be inside a NAS call and cannot be force-
@@ -1565,8 +2530,16 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self.refresh_btn:
             self.refresh_btn.setEnabled(False)
+        # Capture one last real PotPlayer position before stopping the timer.
+        # This keeps a pause/exit of MoviePoster from discarding the latest
+        # sampled position; it does not invent progress when WM_USER cannot
+        # read a live player window.
+        if self._play_sessions:
+            self._poll_play_sessions()
         if self._play_timer.isActive():
             self._play_timer.stop()
+        if getattr(self, "subscription_auto_sync", None):
+            self.subscription_auto_sync.stop()
         scan_running = bool(getattr(self, "worker", None) and self.worker.isRunning())
         recent_running = bool(self._recent_worker and self._recent_worker.isRunning())
         if scan_running:
@@ -1660,10 +2633,14 @@ class ManualMetadataDialog(QDialog):
         self.status.setStyleSheet("color: #9aa4b2;")
         root.addWidget(self.status)
         preview = QHBoxLayout()
+        preview_width, preview_height = _iphone_duo_poster_size(120)
+        preview_radius = _iphone_duo_corner_radius(preview_width, preview_height)
         self.preview_poster = QLabel("暂无海报")
-        self.preview_poster.setFixedSize(120, 170)
+        self.preview_poster.setFixedSize(preview_width, preview_height)
         self.preview_poster.setAlignment(Qt.AlignCenter)
-        self.preview_poster.setStyleSheet("background: #232933; border-radius: 6px; color: #9aa4b2;")
+        self.preview_poster.setStyleSheet(
+            f"background: #232933; border-radius: {preview_radius}px; color: #9aa4b2;"
+        )
         preview.addWidget(self.preview_poster, 0, Qt.AlignTop)
         details = QVBoxLayout()
         self.preview_title = QLabel("标题：")
@@ -1732,7 +2709,12 @@ class ManualMetadataDialog(QDialog):
         self.preview_actors.setText(f"演员：{actors}")
         self.preview_summary.setPlainText(meta.get("summary") or "暂无简介")
         if self._poster_path and os.path.exists(self._poster_path):
-            self.preview_poster.setPixmap(QPixmap(self._poster_path).scaled(120, 170, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            width, height = _iphone_duo_poster_size(120)
+            radius = _iphone_duo_corner_radius(width, height)
+            pix = QPixmap(self._poster_path).scaled(
+                width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+            self.preview_poster.setPixmap(_rounded_pixmap(pix, width, height, radius))
             self.preview_poster.setText("")
         self.confirm_btn.setEnabled(True)
 
@@ -1801,13 +2783,15 @@ class DetailPage(QWidget):
         info.setContentsMargins(52, 0, 32, 0)
         info.setAlignment(Qt.AlignTop)
         self.poster = QLabel()
-        self.poster.setFixedSize(220, 290)
+        poster_width, poster_height = _iphone_duo_poster_size(220)
+        poster_radius = _iphone_duo_corner_radius(poster_width, poster_height)
+        self.poster.setFixedSize(poster_width, poster_height)
         self.poster.setAlignment(Qt.AlignCenter)
         # V8：海报是独立前景层，不参与 backdrop 的模糊和渐变遮罩。
         self.poster.setAttribute(Qt.WA_TranslucentBackground)
         self.poster.setStyleSheet(
             "background: #232933; border: 1px solid rgba(255,255,255,80); "
-            "border-radius: 8px; color: #4a5568;"
+            f"border-radius: {poster_radius}px; color: #4a5568;"
         )
         poster_shadow = QGraphicsDropShadowEffect(self.poster)
         poster_shadow.setBlurRadius(24)
@@ -1991,14 +2975,16 @@ class DetailPage(QWidget):
     def load(self, item_id: int):
         """Load details without allowing a failed enrichment step to hang the page."""
         self.loading_label.show()
+        self.loading_label.setText("正在加载…")
         self._loading_timer.start(5000)
         try:
             self._load_impl(item_id)
         except Exception as exc:
             self.loading_label.setText(f"部分信息加载失败，已保留可用内容：{exc}")
-        finally:
-            self._finish_loading()
             self._loading_timer.stop()
+            return
+        self._loading_timer.stop()
+        self._finish_loading()
 
     def _toggle_summary(self, expanded: bool):
         self.summary.setMaximumHeight(300 if expanded else 64)
@@ -2167,9 +3153,11 @@ class DetailPage(QWidget):
         backdrop = self.win.images.resolve(row, "backdrop") or (row["backdrop"] or "")
         self.backdrop.set_path(backdrop, poster)
         if poster and os.path.exists(poster):
-            pm = QPixmap(poster).scaled(220, 290, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            self.poster.setPixmap(pm)
-            self.poster.setFixedSize(220, 290)
+            width, height = _iphone_duo_poster_size(220)
+            radius = _iphone_duo_corner_radius(width, height)
+            pm = self.win._cover_pixmap(poster, width, height)
+            self.poster.setPixmap(_rounded_pixmap(pm, width, height, radius))
+            self.poster.setFixedSize(width, height)
         else:
             self.poster.setText("暂无海报")
             self.poster.setPixmap(QPixmap())
@@ -2585,10 +3573,11 @@ class SettingsPage(QWidget):
         self.potplayer = QLineEdit(str(win.config.get("potplayer", "")))
         self.douban = QCheckBox("自动抓取豆瓣评分与海报")
         self.douban.setChecked(bool(win.config.get("douban_enabled", True)))
-        self.delay = QSpinBox()
+        self.delay = QDoubleSpinBox()
         self.delay.setRange(0, 3)
-        self.delay.setSingleStep(1)
-        self.delay.setValue(int(float(win.config.get("request_delay", 0.4))))
+        self.delay.setDecimals(1)
+        self.delay.setSingleStep(0.1)
+        self.delay.setValue(float(win.config.get("request_delay", 0.4)))
         form.addRow("电视剧目录", self.tv_root)
         form.addRow("电影目录", self.movie_root)
         form.addRow("PotPlayer 路径", self.potplayer)
@@ -2607,10 +3596,21 @@ class SettingsPage(QWidget):
 
     def _save(self):
         cfg = self.win.config
-        cfg.set("tv_root", self.tv_root.text().strip())
-        cfg.set("movie_root", self.movie_root.text().strip())
-        cfg.set("potplayer", self.potplayer.text().strip())
-        cfg.set("douban_enabled", self.douban.isChecked())
-        cfg.set("request_delay", self.delay.value())
+        old_tv_root = str(cfg.get("tv_root", ""))
+        old_movie_root = str(cfg.get("movie_root", ""))
+        new_tv_root = self.tv_root.text().strip()
+        new_movie_root = self.movie_root.text().strip()
+        path_changed = old_tv_root != new_tv_root or old_movie_root != new_movie_root
+        cfg.values.update({
+            "tv_root": new_tv_root,
+            "movie_root": new_movie_root,
+            "potplayer": self.potplayer.text().strip(),
+            "douban_enabled": self.douban.isChecked(),
+            "request_delay": self.delay.value(),
+        })
+        cfg.save()
         self.win.client = DoubanClient(cfg.cache_dir, delay=float(self.delay.value()))
-        self.win.scan()
+        if path_changed:
+            self.win.scan()
+        else:
+            self.win.status_label.setText("设置已保存，未重新扫描媒体库")

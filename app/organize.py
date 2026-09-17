@@ -301,39 +301,78 @@ def _is_busy_dir(path: str) -> bool:
 def apply_plan(plan: OrganizePlan, undo_path: str, dry_run: bool = False) -> list[str]:
     """执行整理，写撤销日志。顺序：移动/回收 -> 删空目录。"""
     log: list[str] = []
-    undo_lines: list[str] = []
     moved = skipped = 0
     del_ops: list[MoveOp] = []
-    for op in plan.ops:
-        if op.kind == "empty_dir_del":
-            del_ops.append(op)
-            continue
+    journal = None
+    journal_started = False
+    journal_failed = False
+
+    def record_undo(line: str) -> bool:
+        nonlocal journal_started, journal_failed
         if dry_run:
-            log.append(f"PLAN {op.label}")
-            continue
-        m, s = _move(op.source, op.target, log)
-        moved += m
-        skipped += s
-        if m:
-            undo_lines.append(f"mv\t{op.source}\t{op.target}")
-    # 空目录删除
-    for op in sorted(del_ops, key=lambda o: o.source.count(os.sep), reverse=True):
-        if dry_run:
-            log.append(f"PLAN {op.label}")
-            continue
+            return True
+        if journal is None or journal_failed:
+            return False
         try:
-            if os.path.isdir(op.source) and not os.listdir(op.source):
-                os.rmdir(op.source)
-                undo_lines.append(f"del\t{op.source}\t")
-                moved += 1
-            else:
+            if not journal_started:
+                journal.write("-- batch --\n")
+                journal_started = True
+            journal.write(line + "\n")
+            journal.flush()
+            return True
+        except OSError as exc:
+            journal_failed = True
+            log.append(f"FAIL 写入撤销记录：{exc}")
+            return False
+
+    if not dry_run:
+        try:
+            # Open before the first operation so a journal I/O failure cannot
+            # start an unrecorded batch.
+            journal = open(undo_path, "a", encoding="utf-8")
+        except OSError as exc:
+            log.append(f"FAIL 无法创建撤销记录：{exc}")
+            return [*log, "整理未执行：没有可靠的撤销记录"]
+
+    try:
+        for op in plan.ops:
+            if op.kind == "empty_dir_del":
+                del_ops.append(op)
+                continue
+            if dry_run:
+                log.append(f"PLAN {op.label}")
+                continue
+            if journal_failed:
                 skipped += 1
-        except OSError as e:
-            log.append(f"FAIL {op.label}: {e}")
-            skipped += 1
-    if undo_lines:
-        with open(undo_path, "a", encoding="utf-8") as f:
-            f.write("-- batch --\n" + "\n".join(undo_lines) + "\n")
+                continue
+            m, s = _move(op.source, op.target, log)
+            moved += m
+            skipped += s
+            if m and not record_undo(f"mv\t{op.source}\t{op.target}"):
+                skipped += 1
+                break
+        # 空目录删除
+        if not journal_failed:
+            for op in sorted(del_ops, key=lambda o: o.source.count(os.sep), reverse=True):
+                if dry_run:
+                    log.append(f"PLAN {op.label}")
+                    continue
+                try:
+                    if os.path.isdir(op.source) and not os.listdir(op.source):
+                        os.rmdir(op.source)
+                        if record_undo(f"del\t{op.source}\t"):
+                            moved += 1
+                        else:
+                            skipped += 1
+                            break
+                    else:
+                        skipped += 1
+                except OSError as e:
+                    log.append(f"FAIL {op.label}: {e}")
+                    skipped += 1
+    finally:
+        if journal is not None:
+            journal.close()
     log.append(f"完成：整理 {moved}，跳过 {skipped}")
     return log
 
@@ -341,7 +380,8 @@ def apply_plan(plan: OrganizePlan, undo_path: str, dry_run: bool = False) -> lis
 def undo_last(undo_path: str) -> list[str]:
     if not os.path.exists(undo_path):
         return ["没有撤销记录"]
-    lines = [l for l in open(undo_path, encoding="utf-8").read().splitlines() if l]
+    with open(undo_path, encoding="utf-8") as f:
+        lines = [l for l in f.read().splitlines() if l]
     if not lines:
         return ["没有撤销记录"]
     try:
@@ -370,17 +410,27 @@ def undo_last(undo_path: str) -> list[str]:
                     failed.append(line)
             else:
                 if os.path.exists(target):
-                    os.makedirs(os.path.dirname(source), exist_ok=True)
-                    shutil.move(target, source)
-                    undone += 1
+                    if os.path.exists(source):
+                        failed.append(line)
+                        log.append(f"SKIP 撤销冲突，目标已存在：{source}")
+                    else:
+                        os.makedirs(os.path.dirname(source), exist_ok=True)
+                        shutil.move(target, source)
+                        undone += 1
                 else:
                     failed.append(line)
         except Exception as e:
             failed.append(line)
             log.append(f"FAIL 撤销 {target or source}: {e}")
-    with open(undo_path, "w", encoding="utf-8") as f:
-        content = "\n".join(rest + failed)
-        if content:
-            f.write(content + "\n")
+    content = "\n".join(rest + failed)
+    temp_path = f"{undo_path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            if content:
+                f.write(content + "\n")
+        os.replace(temp_path, undo_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
     log.append(f"撤销完成：{undone} 项")
     return log

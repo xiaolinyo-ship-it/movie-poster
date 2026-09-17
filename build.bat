@@ -1,19 +1,9 @@
 @echo off
-setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
-
-echo Building MoviePoster...
-python -m pip install --quiet -r requirements.txt
-python -m pip install --quiet pyinstaller
-python -m PyInstaller --noconfirm --clean MoviePoster.spec
-
-if errorlevel 1 (
-  echo Build failed.
-  exit /b 1
-)
-
+echo 正在打包为 exe ...
+python -m pip install --quiet pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m PyInstaller --noconfirm --clean --noconsole --name MoviePoster --icon assets\MoviePoster.ico --add-data "config.json;." main.py
 echo.
-echo Build complete: dist\MoviePoster\MoviePoster.exe
-echo NOTE: config.json, databases, caches and local media are intentionally NOT bundled.
-endlocal
+echo 打包完成：dist\MoviePoster\MoviePoster.exe
+pause

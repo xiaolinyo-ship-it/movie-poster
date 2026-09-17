@@ -13,9 +13,26 @@ SUB_EXTS = {".srt", ".ass", ".ssa", ".sub", ".idx"}
 
 EP_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 SEASON_DIR_RE = re.compile(r"(?:[Ss]eason\s*|S)?0?(\d{1,2})(?:\s*季)?$", re.IGNORECASE)
-CN_SEASON_RE = re.compile(r"第\s*(\d{1,2})\s*季")
-CN_EP_RE = re.compile(r"第\s*(\d{1,3})\s*[集话]")
+CN_SEASON_RE = re.compile(r"第\s*([\d一二三四五六七八九十百]+)\s*季")
+CN_EP_RE = re.compile(r"第\s*([\d一二三四五六七八九十百]+)\s*[集话]")
 LONE_EP_RE = re.compile(r"(?:^|[^\d])[Ee](\d{1,3})(?:[^\d]|$)")
+
+
+def _number_token(value: str) -> int | None:
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+              "百": 100}
+    if not value or any(ch not in digits for ch in value):
+        return None
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, _, right = value.partition("十")
+        return (digits.get(left, 1) if left else 1) * 10 + (digits.get(right, 0) if right else 0)
+    return digits.get(value)
 
 
 def is_video(name: str) -> bool:
@@ -40,6 +57,7 @@ class MediaItem:
     title: str
     path: str
     files: list[MediaFile] = field(default_factory=list)
+    scan_complete: bool = True
 
     @property
     def season_count(self) -> int:
@@ -70,22 +88,38 @@ def _parse_episode(name: str, parent_dir: str | None = None) -> tuple[int, int |
     if parent_dir:
         cm = CN_SEASON_RE.search(parent_dir)
         if cm:
-            season = int(cm.group(1))
+            season = _number_token(cm.group(1)) or 0
         else:
             sm = SEASON_DIR_RE.search(parent_dir)
             season = int(sm.group(1)) if sm else 0
         em = CN_EP_RE.search(name)
         if em:
-            return season, int(em.group(1))
+            episode = _number_token(em.group(1))
+            return season, episode
         le = LONE_EP_RE.search(name)
         if le and season:
             return season, int(le.group(1))
+        if season:
+            # Keep a reliable season even when this filename has no
+            # recognizable episode number; unknown is not season zero.
+            return season, None
     return 0, None
 
 
-def _scan_files(root: str) -> list[MediaFile]:
+def _scan_files(
+    root: str,
+    errors: list[str] | None = None,
+    should_cancel=None,
+) -> tuple[list[MediaFile], bool]:
     out: list[MediaFile] = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    local_errors: list[str] = []
+
+    def onerror(exc: OSError):
+        local_errors.append(f"{getattr(exc, 'filename', root) or root}: {exc}")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+        if should_cancel and should_cancel():
+            return out, False
         # 跳过回收站
         dirnames[:] = [d for d in dirnames if d != "#recycle" and d.lower() != "sample"]
         for fn in filenames:
@@ -97,20 +131,32 @@ def _scan_files(root: str) -> list[MediaFile]:
             season, episode = _parse_episode(fn, parent)
             out.append(MediaFile(path=os.path.join(dirpath, fn), name=fn, season=season, episode=episode))
     out.sort(key=lambda f: (f.season, f.episode or 0, f.name))
-    return out
+    if errors is not None:
+        errors.extend(local_errors)
+    return out, not local_errors
 
 
-def scan_tv(root: str) -> list[MediaItem]:
+def scan_tv(root: str, errors: list[str] | None = None, should_cancel=None) -> list[MediaItem]:
     items: list[MediaItem] = []
     if not root or not os.path.isdir(root):
+        if errors is not None:
+            errors.append(f"电视剧根目录不可访问：{root or '(空)'}")
         return items
-    for name in sorted(os.listdir(root)):
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"电视剧根目录不可读取：{root}: {exc}")
+        return items
+    for name in names:
+        if should_cancel and should_cancel():
+            return items
         d = os.path.join(root, name)
         if not os.path.isdir(d) or name == "#recycle":
             continue
-        files = _scan_files(d)
+        files, complete = _scan_files(d, errors, should_cancel)
         if files:
-            items.append(MediaItem(kind="tv", title=name, path=d, files=files))
+            items.append(MediaItem(kind="tv", title=name, path=d, files=files, scan_complete=complete))
     items.sort(key=lambda i: i.title.lower())
     return items
 
@@ -143,18 +189,28 @@ def _resolve_movie_branches(top_dir: str, cur_dir: str, depth: int) -> list[tupl
     return []
 
 
-def scan_movies(root: str) -> list[MediaItem]:
+def scan_movies(root: str, errors: list[str] | None = None, should_cancel=None) -> list[MediaItem]:
     items: list[MediaItem] = []
     if not root or not os.path.isdir(root):
+        if errors is not None:
+            errors.append(f"电影根目录不可访问：{root or '(空)'}")
         return items
-    for name in sorted(os.listdir(root)):
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"电影根目录不可读取：{root}: {exc}")
+        return items
+    for name in names:
+        if should_cancel and should_cancel():
+            return items
         d = os.path.join(root, name)
         if not os.path.isdir(d) or name == "#recycle":
             continue
         for title, play_dir in _resolve_movie_branches(d, d, 1):
-            files = _scan_files(play_dir)
+            files, complete = _scan_files(play_dir, errors, should_cancel)
             if files:
-                items.append(MediaItem(kind="movie", title=title, path=play_dir, files=files))
+                items.append(MediaItem(kind="movie", title=title, path=play_dir, files=files, scan_complete=complete))
     items.sort(key=lambda i: i.title.lower())
     return items
 

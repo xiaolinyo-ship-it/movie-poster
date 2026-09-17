@@ -503,11 +503,16 @@ class Store:
 
     def list_files(self, item_id: int) -> list[sqlite3.Row]:
         return self.conn.execute(
-            """SELECT f.*, e.episode_title, e.overview, e.air_date,
+            """SELECT f.id, f.item_id, f.path, f.filename, f.season, f.episode,
+                      f.updated_at, f.episode_id,
+                      e.episode_title, e.overview, e.air_date,
                       COALESCE(p.progress, f.progress, 0) AS progress,
                       COALESCE(p.duration, f.duration, 0) AS duration,
                       COALESCE(p.watched, f.watched, 0) AS watched,
-                      COALESCE(p.playback_state, f.playback_state, 'never') AS playback_state
+                      COALESCE(p.playback_state, f.playback_state, 'never') AS playback_state,
+                      COALESCE(p.last_played_at, f.last_played_at) AS last_played_at,
+                      COALESCE(p.play_count, f.play_count, 0) AS play_count,
+                      p.updated_at AS playback_updated_at
                FROM files f
                LEFT JOIN episodes e ON e.id=f.episode_id
                LEFT JOIN playback p ON p.file_id=f.id
@@ -556,18 +561,30 @@ class Store:
 
     def get_file(self, path: str) -> sqlite3.Row | None:
         return self.conn.execute(
-            """SELECT f.*, COALESCE(p.progress, f.progress, 0) AS progress,
+            """SELECT f.id, f.item_id, f.path, f.filename, f.season, f.episode,
+                      f.updated_at, f.episode_id,
+                      COALESCE(p.progress, f.progress, 0) AS progress,
                       COALESCE(p.duration, f.duration, 0) AS duration,
                       COALESCE(p.watched, f.watched, 0) AS watched,
-                      COALESCE(p.playback_state, f.playback_state, 'never') AS playback_state
+                      COALESCE(p.playback_state, f.playback_state, 'never') AS playback_state,
+                      COALESCE(p.last_played_at, f.last_played_at) AS last_played_at,
+                      COALESCE(p.play_count, f.play_count, 0) AS play_count,
+                      p.updated_at AS playback_updated_at
                FROM files f LEFT JOIN playback p ON p.file_id=f.id WHERE f.path=?""", (path,)
         ).fetchone()
 
     def set_progress(self, path: str, progress: float, duration: float = 0) -> None:
+        now = self._now()
         self.conn.execute(
             "UPDATE files SET progress=?, duration=?, updated_at=? WHERE path=?",
-            (progress, duration, self._now(), path),
+            (progress, duration, now, path),
         )
+        row = self.conn.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
+        if row:
+            self.conn.execute(
+                "UPDATE playback SET progress=?, duration=?, updated_at=? WHERE file_id=?",
+                (float(progress), float(duration), now, row[0]),
+            )
         self.conn.commit()
 
     def update_play_state(
@@ -663,7 +680,13 @@ class Store:
         ).fetchone() is not None
 
     def item_progress(self, item_id: int) -> tuple[int, int]:
-        rows = self.conn.execute("SELECT watched, progress, duration FROM files WHERE item_id=?", (item_id,)).fetchall()
+        rows = self.conn.execute(
+            """SELECT COALESCE(p.watched, f.watched, 0) AS watched,
+                      COALESCE(p.progress, f.progress, 0) AS progress,
+                      COALESCE(p.duration, f.duration, 0) AS duration
+               FROM files f LEFT JOIN playback p ON p.file_id=f.id
+               WHERE f.item_id=?""", (item_id,)
+        ).fetchall()
         total = len(rows)
         done = sum(1 for r in rows if r["watched"] or (r["duration"] and r["progress"] >= r["duration"] * 0.95))
         return done, total
@@ -671,8 +694,12 @@ class Store:
     def continuing_items(self) -> list[tuple[sqlite3.Row, float]]:
         """有播放进度但未看完的条目，按最近更新排序。"""
         rows = self.conn.execute(
-            "SELECT DISTINCT f.item_id, MAX(f.updated_at) AS last FROM files f "
-            "WHERE (f.progress > 0 AND (f.duration = 0 OR f.progress < f.duration * 0.95)) OR f.watched = 1 "
+            "SELECT DISTINCT f.item_id, MAX(COALESCE(p.updated_at, f.updated_at)) AS last FROM files f "
+            "LEFT JOIN playback p ON p.file_id=f.id "
+            "WHERE (COALESCE(p.progress, f.progress, 0) > 0 AND "
+            "(COALESCE(p.duration, f.duration, 0) = 0 OR "
+            "COALESCE(p.progress, f.progress, 0) < COALESCE(p.duration, f.duration, 0) * 0.95)) "
+            "OR COALESCE(p.watched, f.watched, 0) = 1 "
             "GROUP BY f.item_id ORDER BY last DESC"
         ).fetchall()
         out = []

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QMainWindow
 class JellyfinShell(QMainWindow):
     def __init__(self, base_dir: Path):
         super().__init__()
-        self.setWindowTitle("小林影业")
+        self.setWindowTitle("小林影视")
         self.resize(1360, 860)
         self.setMinimumSize(1024, 640)
 
